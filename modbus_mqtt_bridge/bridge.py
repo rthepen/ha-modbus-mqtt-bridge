@@ -265,16 +265,34 @@ class ModbusMqttBridge:
             state_topic = f"{topic_prefix}/{entity_type}/{uid}/state"
             cmd_topic = f"{topic_prefix}/{entity_type}/{uid}/set"
 
+            # Bepaal apparaatnaam en identifiers op basis van slave ID
+            slave = s.get("slave", 1)
+            if slave == 1:
+                dev_name = "Warmtepomp"
+                dev_id = "warmtepomp"
+            elif slave == 2:
+                dev_name = "Sinotimer"
+                dev_id = "sinotimer"
+            elif slave in (3, 4, 5):
+                dev_name = f"KWS Meter {slave - 2}"
+                dev_id = f"kws_meter_{slave - 2}"
+            elif 51 <= slave <= 55:
+                dev_name = f"Growatt Inverter {slave}"
+                dev_id = f"growatt_inverter_{slave}"
+            else:
+                dev_name = f"Modbus Apparaat {slave}"
+                dev_id = f"modbus_device_{slave}"
+
             # Autodiscovery payload conform Home Assistant standaarden
             payload = {
                 "name": name,
                 "unique_id": uid,
                 "state_topic": state_topic,
                 "device": {
-                    "identifiers": ["modbus_usr_n580_bridge"],
-                    "name": "Modbus USR-N580 Bridge",
-                    "model": "Modbus2MQTT Bridge Daemon",
-                    "manufacturer": "Antigravity"
+                    "identifiers": [f"modbus_usr_n580_device_{dev_id}"],
+                    "name": dev_name,
+                    "model": "Modbus RTU-over-TCP Device",
+                    "manufacturer": "USR-N580 Gateway"
                 }
             }
 
@@ -489,14 +507,28 @@ class ModbusMqttBridge:
         sensors = self.config.get("sensors", [])
         logger.info(f"Starten pollingronde voor {len(sensors)} sensoren...")
         
+        failed_slaves = set()
         success_count = 0
+        
         for s in sensors:
+            slave = s.get("slave", 1)
             uid = s.get("unique_id")
+            
+            # Sla over als deze slave al gemarkeerd is als mislukt in deze pollingronde
+            if slave in failed_slaves:
+                modbus_logger.debug(f"Sla {uid} over omdat Slave {slave} in deze ronde al gefaald is.")
+                continue
+                
             val = self.read_sensor(s)
             
             if val is not None:
                 self.publish_sensor_value(uid, val)
                 success_count += 1
+            else:
+                # Markeer als mislukt zodat we overige registers voor deze slave overslaan in deze ronde
+                failed_slaves.add(slave)
+                modbus_logger.warning(f"Slave {slave} reageert niet. Resterende sensors voor deze slave in deze pollingronde worden overgeslagen.")
+                
             # Wacht heel even tussen verzoeken om bus-collisies op de RS485-lijn te minimaliseren
             time.sleep(0.1)
             
