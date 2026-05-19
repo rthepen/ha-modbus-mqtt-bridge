@@ -213,8 +213,8 @@ class ModbusMqttBridge:
             if len(parts) < 4 or parts[-1] != "set":
                 return
                 
-            entity_type = parts[-2]
-            uid = parts[-3]
+            entity_type = parts[-3]
+            uid = parts[-2]
             
             # Zoek de bijbehorende sensor in de configuratie
             sensors = self.config.get("sensors", [])
