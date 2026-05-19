@@ -1,19 +1,21 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/alpine-base:3.19
-FROM ${BUILD_FROM}
+FROM python:3.11-alpine
 
-# Install dependencies
-RUN apk add --no-cache python3 py3-pip py3-yaml
+# Installeer systeemafhankelijkheden
+RUN apk add --no-cache bash
 
+# Werkdirectory instellen
 WORKDIR /app
 
-# Copy requirements
+# Kopieer requirements en installeer python libraries
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt --break-system-packages
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code
+# Kopieer code
 COPY bridge.py .
 COPY run.sh .
 
+# Maak run.sh uitvoerbaar
 RUN chmod +x run.sh
 
+# Start commando
 CMD [ "./run.sh" ]
