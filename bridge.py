@@ -131,8 +131,24 @@ class ModbusMqttBridge:
                         "timeout": 3,
                         "poll_interval": ha_options.get("poll_interval", 15)
                     },
-                    "sensors": ha_options.get("sensors", [])
+                    "sensors": []
                 }
+                
+                # Probeer sensors uit de lokale config.yaml te laden indien aanwezig, anders uit ha_options
+                if os.path.exists("config.yaml"):
+                    logger.info("Lokale config.yaml gevonden. Laden van sensors uit config.yaml...")
+                    try:
+                        with open("config.yaml", 'r', encoding='utf-8') as cf:
+                            local_cfg = yaml.safe_load(cf)
+                            self.config["sensors"] = local_cfg.get("sensors", [])
+                        logger.info(f"Sensoren succesvol geladen uit config.yaml (Totaal: {len(self.config['sensors'])} sensoren).")
+                    except Exception as e:
+                        logger.error(f"Fout bij laden van sensors uit config.yaml: {e}. Terugvallen op addon opties...")
+                        self.config["sensors"] = ha_options.get("sensors", [])
+                else:
+                    logger.warning("Geen lokale config.yaml gevonden. Laden van sensors uit addon opties...")
+                    self.config["sensors"] = ha_options.get("sensors", [])
+
                 self.is_addon = True
                 logger.info("Addon opties succesvol ingeladen en getransformeerd!")
                 return
