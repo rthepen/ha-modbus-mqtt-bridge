@@ -70,6 +70,7 @@ class ModbusMqttBridge:
         self.mqtt_client = None
         self.mqtt_connected = False
         self.slave_states = {}  # Track connectivity status per slave
+        self.is_addon = False
 
         if self.debug:
             logger.setLevel(logging.DEBUG)
@@ -132,6 +133,7 @@ class ModbusMqttBridge:
                     },
                     "sensors": ha_options.get("sensors", [])
                 }
+                self.is_addon = True
                 logger.info("Addon opties succesvol ingeladen en getransformeerd!")
                 return
             except Exception as e:
@@ -167,6 +169,11 @@ class ModbusMqttBridge:
         password = mqtt_cfg.get("password")
         client_id = mqtt_cfg.get("client_id", "modbus_mqtt_bridge")
         keepalive = mqtt_cfg.get("keepalive", 60)
+
+        # Suffix client_id for developer isolation if not running as addon
+        if not getattr(self, "is_addon", False):
+            import socket
+            client_id = f"{client_id}_dev_{socket.gethostname()}"
 
         mqtt_logger.info(f"MQTT Client initialiseren (ID: {client_id})...")
         self.mqtt_client = mqtt.Client(
@@ -406,6 +413,10 @@ class ModbusMqttBridge:
             logger.info(f"[DRY-RUN] Publiceren connectiviteit Slave {slave} -> {status}")
             return
 
+        if not self.mqtt_connected:
+            mqtt_logger.warning(f"MQTT niet verbonden. Connectiviteit voor Slave {slave} overgeslagen.")
+            return
+
         if getattr(self, "slave_states", None) is None:
             self.slave_states = {}
         
@@ -413,10 +424,6 @@ class ModbusMqttBridge:
             return
 
         self.slave_states[slave] = status
-        
-        if not self.mqtt_connected:
-            mqtt_logger.warning(f"MQTT niet verbonden. Connectiviteit voor Slave {slave} overgeslagen.")
-            return
 
         _, dev_id = self.get_device_info_by_slave(slave)
         topic_prefix = self.config.get("mqtt", {}).get("topic_prefix", "usr_n580_bridge")
@@ -485,6 +492,8 @@ class ModbusMqttBridge:
             res = self.modbus_client.write_register(address=address, value=val, device_id=slave)
             if res.isError():
                 modbus_logger.error(f"Fout bij schrijven naar Modbus voor {uid}: {res}")
+                if self.modbus_client:
+                    self.modbus_client.close()
             else:
                 modbus_logger.info(f"Succesvol geschreven naar Modbus voor {uid}: Raw {val}")
                 # Direct de nieuwe status terug publiceren naar MQTT zodat de UI meteen geüpdatet wordt!
@@ -495,6 +504,11 @@ class ModbusMqttBridge:
                     
         except Exception as e:
             modbus_logger.error(f"Exception bij schrijven naar Modbus voor {uid}: {e}")
+            if self.modbus_client:
+                try:
+                    self.modbus_client.close()
+                except Exception:
+                    pass
 
 
     # --------------------------------------------------------------------------
@@ -552,6 +566,8 @@ class ModbusMqttBridge:
 
             if res.isError():
                 modbus_logger.error(f"Fout bij uitlezen {uid} (Slave {slave}, Adres {address}): {res}")
+                if self.modbus_client:
+                    self.modbus_client.close()
                 return None
 
             # Interpreteer de waarde (meestal een signed int16)
@@ -569,6 +585,11 @@ class ModbusMqttBridge:
 
         except Exception as e:
             modbus_logger.error(f"Exception bij uitlezen {uid}: {e}")
+            if self.modbus_client:
+                try:
+                    self.modbus_client.close()
+                except Exception:
+                    pass
             return None
 
     # --------------------------------------------------------------------------
