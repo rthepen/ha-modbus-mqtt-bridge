@@ -1,178 +1,508 @@
-name: "Modbus to MQTT Bridge"
-version: "1.0.5"
-slug: "modbus_mqtt_bridge"
-description: "Bridge Modbus RTU-over-TCP devices to Home Assistant via MQTT"
+name: Modbus to MQTT Bridge
+version: 1.0.6
+slug: modbus_mqtt_bridge
+description: Bridge Modbus RTU-over-TCP devices to Home Assistant via MQTT
 arch:
-  - aarch64
-  - amd64
-  - armhf
-  - armv7
-  - i386
-startup: "services"
-boot: "auto"
+- aarch64
+- amd64
+- armhf
+- armv7
+- i386
+startup: services
+boot: auto
 options:
-  mqtt_broker: "192.168.1.100"
+  mqtt_broker: 192.168.1.100
   mqtt_port: 1883
-  mqtt_username: "mqtt_user"
-  mqtt_password: "mqtt_password"
-  mqtt_topic_prefix: "usr_n580_bridge"
-  mqtt_discovery_prefix: "homeassistant"
-  modbus_host: "192.168.1.200"
+  mqtt_username: mqtt_user
+  mqtt_password: mqtt_password
+  mqtt_topic_prefix: usr_n580_bridge
+  mqtt_discovery_prefix: homeassistant
+  modbus_host: 192.168.1.200
   modbus_port: 41
   poll_interval: 15
   sensors:
-    - name: "Warmtepomp AAN/UIT status"
-      unique_id: "warmtepomp_power_status"
-      slave: 1
-      register_type: "holding"
-      address: 0
-      data_type: "int16"
-      scale: 1.0
-      precision: 0
-      unit_of_measurement: ""
-      device_class: ""
-      state_class: "measurement"
-      writeable: true
-      entity_type: "switch"
-    - name: "Warmtepomp Modus"
-      unique_id: "warmtepomp_mode_status"
-      slave: 1
-      register_type: "holding"
-      address: 1
-      data_type: "int16"
-      scale: 1.0
-      precision: 0
-      unit_of_measurement: ""
-      device_class: ""
-      state_class: "measurement"
-    - name: "Warmtepomp Doeltemperatuur"
-      unique_id: "warmtepomp_target_temp_modbus"
-      slave: 1
-      register_type: "holding"
-      address: 11
-      data_type: "int16"
-      scale: 1.0
-      precision: 0
-      unit_of_measurement: "°C"
-      device_class: "temperature"
-      state_class: "measurement"
-      writeable: true
-      entity_type: "number"
-      min: 15
-      max: 45
-      step: 1
-    - name: "Warmtepomp Temp Water In"
-      unique_id: "warmtepomp_temp_in_modbus"
-      slave: 1
-      register_type: "holding"
-      address: 104
-      data_type: "int16"
-      scale: 1.0
-      precision: 0
-      unit_of_measurement: "°C"
-      device_class: "temperature"
-      state_class: "measurement"
-    - name: "Warmtepomp Temp Buiten"
-      unique_id: "warmtepomp_temp_buiten_modbus"
-      slave: 1
-      register_type: "holding"
-      address: 107
-      data_type: "int16"
-      scale: 1.0
-      precision: 0
-      unit_of_measurement: "°C"
-      device_class: "temperature"
-      state_class: "measurement"
-    - name: "Sinotimer Spanning"
-      unique_id: "sinotimer_spanning"
-      slave: 2
-      register_type: "input"
-      address: 0
-      data_type: "int16"
-      scale: 0.1
-      precision: 1
-      unit_of_measurement: "V"
-      device_class: "voltage"
-      state_class: "measurement"
-    - name: "Sinotimer Stroom"
-      unique_id: "sinotimer_stroom"
-      slave: 2
-      register_type: "input"
-      address: 3
-      data_type: "int16"
-      scale: 0.01
-      precision: 2
-      unit_of_measurement: "A"
-      device_class: "current"
-      state_class: "measurement"
-    - name: "Sinotimer Actief Vermogen"
-      unique_id: "sinotimer_vermogen"
-      slave: 2
-      register_type: "input"
-      address: 8
-      data_type: "int16"
-      scale: 1.0
-      precision: 0
-      unit_of_measurement: "W"
-      device_class: "power"
-      state_class: "measurement"
-    - name: "KWS Meter 1 Spanning"
-      unique_id: "kws_meter_1_spanning"
-      slave: 3
-      register_type: "holding"
-      address: 14
-      data_type: "int16"
-      scale: 0.01
-      precision: 1
-      unit_of_measurement: "V"
-      device_class: "voltage"
-      state_class: "measurement"
-    - name: "KWS Meter 2 Spanning"
-      unique_id: "kws_meter_2_spanning"
-      slave: 4
-      register_type: "holding"
-      address: 14
-      data_type: "int16"
-      scale: 0.01
-      precision: 1
-      unit_of_measurement: "V"
-      device_class: "voltage"
-      state_class: "measurement"
-    - name: "KWS Meter 3 Spanning"
-      unique_id: "kws_meter_3_spanning"
-      slave: 5
-      register_type: "holding"
-      address: 14
-      data_type: "int16"
-      scale: 0.01
-      precision: 1
-      unit_of_measurement: "V"
-      device_class: "voltage"
-      state_class: "measurement"
+  - name: Warmtepomp AAN/UIT status
+    unique_id: warmtepomp_power_status
+    slave: 1
+    register_type: holding
+    address: 0
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: ''
+    device_class: ''
+    state_class: measurement
+    writeable: true
+    entity_type: switch
+  - name: Warmtepomp Modus
+    unique_id: warmtepomp_mode_status
+    slave: 1
+    register_type: holding
+    address: 1
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: ''
+    device_class: ''
+    state_class: measurement
+  - name: Warmtepomp Doeltemperatuur
+    unique_id: warmtepomp_target_temp_modbus
+    slave: 1
+    register_type: holding
+    address: 11
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+    writeable: true
+    entity_type: number
+    min: 15
+    max: 45
+    step: 1
+  - name: Warmtepomp Temp Water In
+    unique_id: warmtepomp_temp_in_modbus
+    slave: 1
+    register_type: holding
+    address: 104
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+  - name: Warmtepomp Temp Buiten
+    unique_id: warmtepomp_temp_buiten_modbus
+    slave: 1
+    register_type: holding
+    address: 107
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+  - name: Sinotimer Spanning
+    unique_id: sinotimer_spanning
+    slave: 2
+    register_type: input
+    address: 0
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+  - name: Sinotimer Stroom
+    unique_id: sinotimer_stroom
+    slave: 2
+    register_type: input
+    address: 3
+    data_type: int16
+    scale: 0.01
+    precision: 2
+    unit_of_measurement: A
+    device_class: current
+    state_class: measurement
+  - name: Sinotimer Actief Vermogen
+    unique_id: sinotimer_vermogen
+    slave: 2
+    register_type: input
+    address: 8
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: KWS Meter 1 Spanning
+    unique_id: kws_meter_1_spanning
+    slave: 3
+    register_type: holding
+    address: 14
+    data_type: int16
+    scale: 0.01
+    precision: 1
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+  - name: KWS Meter 2 Spanning
+    unique_id: kws_meter_2_spanning
+    slave: 4
+    register_type: holding
+    address: 14
+    data_type: int16
+    scale: 0.01
+    precision: 1
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+  - name: KWS Meter 3 Spanning
+    unique_id: kws_meter_3_spanning
+    slave: 5
+    register_type: holding
+    address: 14
+    data_type: int16
+    scale: 0.01
+    precision: 1
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+  - name: Growatt Inverter 51 Run Status
+    unique_id: growatt_status_51
+    slave: 51
+    register_type: input
+    address: 0
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: ''
+    device_class: ''
+    state_class: measurement
+  - name: Growatt Inverter 51 Ingangsvermogen
+    unique_id: growatt_ppv_51
+    slave: 51
+    register_type: input
+    address: 1
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 51 Uitgangsvermogen
+    unique_id: growatt_pac_51
+    slave: 51
+    register_type: input
+    address: 35
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 51 Opbrengst Vandaag
+    unique_id: growatt_eac_today_51
+    slave: 51
+    register_type: input
+    address: 53
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 51 Opbrengst Totaal
+    unique_id: growatt_eac_total_51
+    slave: 51
+    register_type: input
+    address: 55
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 51 Temperatuur
+    unique_id: growatt_temp_51
+    slave: 51
+    register_type: input
+    address: 93
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+  - name: Growatt Inverter 52 Run Status
+    unique_id: growatt_status_52
+    slave: 52
+    register_type: input
+    address: 0
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: ''
+    device_class: ''
+    state_class: measurement
+  - name: Growatt Inverter 52 Ingangsvermogen
+    unique_id: growatt_ppv_52
+    slave: 52
+    register_type: input
+    address: 1
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 52 Uitgangsvermogen
+    unique_id: growatt_pac_52
+    slave: 52
+    register_type: input
+    address: 35
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 52 Opbrengst Vandaag
+    unique_id: growatt_eac_today_52
+    slave: 52
+    register_type: input
+    address: 53
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 52 Opbrengst Totaal
+    unique_id: growatt_eac_total_52
+    slave: 52
+    register_type: input
+    address: 55
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 52 Temperatuur
+    unique_id: growatt_temp_52
+    slave: 52
+    register_type: input
+    address: 93
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+  - name: Growatt Inverter 53 Run Status
+    unique_id: growatt_status_53
+    slave: 53
+    register_type: input
+    address: 0
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: ''
+    device_class: ''
+    state_class: measurement
+  - name: Growatt Inverter 53 Ingangsvermogen
+    unique_id: growatt_ppv_53
+    slave: 53
+    register_type: input
+    address: 1
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 53 Uitgangsvermogen
+    unique_id: growatt_pac_53
+    slave: 53
+    register_type: input
+    address: 35
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 53 Opbrengst Vandaag
+    unique_id: growatt_eac_today_53
+    slave: 53
+    register_type: input
+    address: 53
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 53 Opbrengst Totaal
+    unique_id: growatt_eac_total_53
+    slave: 53
+    register_type: input
+    address: 55
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 53 Temperatuur
+    unique_id: growatt_temp_53
+    slave: 53
+    register_type: input
+    address: 93
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+  - name: Growatt Inverter 54 Run Status
+    unique_id: growatt_status_54
+    slave: 54
+    register_type: input
+    address: 0
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: ''
+    device_class: ''
+    state_class: measurement
+  - name: Growatt Inverter 54 Ingangsvermogen
+    unique_id: growatt_ppv_54
+    slave: 54
+    register_type: input
+    address: 1
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 54 Uitgangsvermogen
+    unique_id: growatt_pac_54
+    slave: 54
+    register_type: input
+    address: 35
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 54 Opbrengst Vandaag
+    unique_id: growatt_eac_today_54
+    slave: 54
+    register_type: input
+    address: 53
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 54 Opbrengst Totaal
+    unique_id: growatt_eac_total_54
+    slave: 54
+    register_type: input
+    address: 55
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 54 Temperatuur
+    unique_id: growatt_temp_54
+    slave: 54
+    register_type: input
+    address: 93
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
+  - name: Growatt Inverter 55 Run Status
+    unique_id: growatt_status_55
+    slave: 55
+    register_type: input
+    address: 0
+    data_type: int16
+    scale: 1.0
+    precision: 0
+    unit_of_measurement: ''
+    device_class: ''
+    state_class: measurement
+  - name: Growatt Inverter 55 Ingangsvermogen
+    unique_id: growatt_ppv_55
+    slave: 55
+    register_type: input
+    address: 1
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 55 Uitgangsvermogen
+    unique_id: growatt_pac_55
+    slave: 55
+    register_type: input
+    address: 35
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: W
+    device_class: power
+    state_class: measurement
+  - name: Growatt Inverter 55 Opbrengst Vandaag
+    unique_id: growatt_eac_today_55
+    slave: 55
+    register_type: input
+    address: 53
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 55 Opbrengst Totaal
+    unique_id: growatt_eac_total_55
+    slave: 55
+    register_type: input
+    address: 55
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+  - name: Growatt Inverter 55 Temperatuur
+    unique_id: growatt_temp_55
+    slave: 55
+    register_type: input
+    address: 93
+    data_type: int16
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: °C
+    device_class: temperature
+    state_class: measurement
 schema:
-  mqtt_broker: "str"
-  mqtt_port: "int"
-  mqtt_username: "str?"
-  mqtt_password: "password?"
-  mqtt_topic_prefix: "str"
-  mqtt_discovery_prefix: "str"
-  modbus_host: "str"
-  modbus_port: "int"
-  poll_interval: "int"
+  mqtt_broker: str
+  mqtt_port: int
+  mqtt_username: str?
+  mqtt_password: password?
+  mqtt_topic_prefix: str
+  mqtt_discovery_prefix: str
+  modbus_host: str
+  modbus_port: int
+  poll_interval: int
   sensors:
-    - name: "str"
-      unique_id: "str"
-      slave: "int"
-      register_type: "list(holding|input)"
-      address: "int"
-      data_type: "list(int16|uint16|int32|uint32)"
-      scale: "float"
-      precision: "int"
-      unit_of_measurement: "str?"
-      device_class: "str?"
-      state_class: "str?"
-      writeable: "bool?"
-      entity_type: "list(sensor|switch|number)?"
-      min: "float?"
-      max: "float?"
-      step: "float?"
+  - name: str
+    unique_id: str
+    slave: int
+    register_type: list(holding|input)
+    address: int
+    data_type: list(int16|uint16|int32|uint32)
+    scale: float
+    precision: int
+    unit_of_measurement: str?
+    device_class: str?
+    state_class: str?
+    writeable: bool?
+    entity_type: list(sensor|switch|number)?
+    min: float?
+    max: float?
+    step: float?
