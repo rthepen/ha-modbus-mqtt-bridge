@@ -367,6 +367,10 @@ class ModbusMqttBridge:
                 payload["command_topic"] = cmd_topic
                 payload["payload_on"] = "ON"
                 payload["payload_off"] = "OFF"
+            elif entity_type == "select":
+                payload["value_template"] = "{{ value_json.value }}"
+                payload["command_topic"] = cmd_topic
+                payload["options"] = s.get("options", [])
             elif entity_type == "number":
                 payload["value_template"] = "{{ value_json.value }}"
                 payload["command_topic"] = cmd_topic
@@ -408,14 +412,27 @@ class ModbusMqttBridge:
 
         # Zoek het entiteitstype voor het juiste topic
         entity_type = "sensor"
+        options = []
         for s in self.config.get("sensors", []):
             if s.get("unique_id") == unique_id:
                 entity_type = s.get("entity_type", "sensor")
+                options = s.get("options", [])
                 break
 
         topic_prefix = self.config.get("mqtt", {}).get("topic_prefix", "usr_n580_bridge")
         state_topic = f"{topic_prefix}/{entity_type}/{unique_id}/state"
-        payload = json.dumps({"value": value})
+        
+        # Mapping index to string for select type
+        pub_value = value
+        if entity_type == "select" and options:
+            try:
+                idx = int(round(float(value)))
+                if 0 <= idx < len(options):
+                    pub_value = options[idx]
+            except (ValueError, TypeError):
+                pass
+
+        payload = json.dumps({"value": pub_value})
 
         try:
             mqtt_logger.debug(f"Publiceer: {state_topic} -> {payload}")
@@ -471,6 +488,16 @@ class ModbusMqttBridge:
                     val = 0
                 else:
                     val = int(payload)
+            elif entity_type == "select":
+                options = sensor.get("options", [])
+                if payload in options:
+                    val = options.index(payload)
+                else:
+                    try:
+                        val = int(round(float(payload)))
+                    except ValueError:
+                        modbus_logger.error(f"Ongeldige optie '{payload}' voor select {uid}. Beschikbare opties: {options}")
+                        return
             else:
                 # Converteer naar float en pas inverse scaling toe
                 float_val = float(payload)
@@ -496,7 +523,13 @@ class ModbusMqttBridge:
         try:
             if self.dry_run:
                 modbus_logger.info(f"[DRY-RUN] Schrijven naar register {address} op slave {slave} met waarde {val}")
-                self.publish_sensor_value(uid, float(payload) if entity_type != "switch" else (1 if val == 1 else 0))
+                if entity_type == "switch":
+                    pub_val = 1 if val == 1 else 0
+                elif entity_type == "select":
+                    pub_val = val
+                else:
+                    pub_val = float(payload)
+                self.publish_sensor_value(uid, pub_val)
                 return
                 
             # Alleen holding registers kunnen geschreven worden in Modbus

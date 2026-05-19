@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Kopieer code
 COPY bridge.py .
-COPY config.yaml .
+COPY bridge_sensors.yaml config.yaml
 COPY run.sh .
 
 # Maak run.sh uitvoerbaar
