@@ -1,5 +1,5 @@
 name: "Modbus to MQTT Bridge"
-version: "1.0.3"
+version: "1.0.4"
 slug: "modbus_mqtt_bridge"
 description: "Bridge Modbus RTU-over-TCP devices to Home Assistant via MQTT"
 arch:
@@ -32,6 +32,8 @@ options:
       unit_of_measurement: ""
       device_class: ""
       state_class: "measurement"
+      writeable: true
+      entity_type: "switch"
     - name: "Warmtepomp Modus"
       unique_id: "warmtepomp_mode_status"
       slave: 1
@@ -54,6 +56,11 @@ options:
       unit_of_measurement: "°C"
       device_class: "temperature"
       state_class: "measurement"
+      writeable: true
+      entity_type: "number"
+      min: 15
+      max: 45
+      step: 1
     - name: "Warmtepomp Temp Water In"
       unique_id: "warmtepomp_temp_in_modbus"
       slave: 1
@@ -164,3 +171,8 @@ schema:
       unit_of_measurement: "str?"
       device_class: "str?"
       state_class: "str?"
+      writeable: "bool?"
+      entity_type: "list(sensor|switch|number)?"
+      min: "float?"
+      max: "float?"
+      step: "float?"

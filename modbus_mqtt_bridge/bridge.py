@@ -160,6 +160,7 @@ class ModbusMqttBridge:
         # callbacks koppelen
         self.mqtt_client.on_connect = self.on_mqtt_connect
         self.mqtt_client.on_disconnect = self.on_mqtt_disconnect
+        self.mqtt_client.on_message = self.on_mqtt_message
 
         mqtt_logger.info(f"Verbinden met MQTT broker op {broker}:{port}...")
         try:
@@ -174,6 +175,22 @@ class ModbusMqttBridge:
         if rc == 0:
             mqtt_logger.info("Succesvol verbonden met MQTT Broker!")
             self.mqtt_connected = True
+            
+            # Abonneer op command topics voor alle schrijfbare sensoren
+            topic_prefix = self.config.get("mqtt", {}).get("topic_prefix", "usr_n580_bridge")
+            sensors = self.config.get("sensors", [])
+            subscribed_count = 0
+            for s in sensors:
+                if s.get("writeable", False):
+                    uid = s.get("unique_id")
+                    entity_type = s.get("entity_type", "sensor")
+                    cmd_topic = f"{topic_prefix}/{entity_type}/{uid}/set"
+                    mqtt_logger.info(f"Abonneren op command topic: {cmd_topic}")
+                    self.mqtt_client.subscribe(cmd_topic)
+                    subscribed_count += 1
+            if subscribed_count > 0:
+                mqtt_logger.info(f"Geabonneerd op {subscribed_count} command topics.")
+                    
             # Direct HA Discovery uitvoeren om entiteiten aan te maken/vernieuwen
             self.publish_ha_discovery()
         else:
@@ -183,6 +200,43 @@ class ModbusMqttBridge:
         """Callback bij MQTT ontkoppeling."""
         mqtt_logger.warning(f"MQTT verbinding verbroken (code: {rc}). Proberen opnieuw te verbinden...")
         self.mqtt_connected = False
+
+    def on_mqtt_message(self, client, userdata, msg):
+        """Callback bij ontvangen MQTT bericht (commando)."""
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode('utf-8')
+            mqtt_logger.info(f"MQTT bericht ontvangen op {topic}: {payload}")
+            
+            # Ontleed het topic: [topic_prefix]/[entity_type]/[unique_id]/set
+            parts = topic.split('/')
+            if len(parts) < 4 or parts[-1] != "set":
+                return
+                
+            entity_type = parts[-2]
+            uid = parts[-3]
+            
+            # Zoek de bijbehorende sensor in de configuratie
+            sensors = self.config.get("sensors", [])
+            sensor = None
+            for s in sensors:
+                if s.get("unique_id") == uid:
+                    sensor = s
+                    break
+                    
+            if not sensor:
+                mqtt_logger.error(f"Geen sensor gevonden met unique_id: {uid}")
+                return
+                
+            if not sensor.get("writeable", False):
+                mqtt_logger.error(f"Sensor {uid} is niet gemarkeerd als schrijfbaar!")
+                return
+                
+            # Schrijf de nieuwe waarde naar Modbus
+            self.write_sensor(sensor, payload)
+            
+        except Exception as e:
+            mqtt_logger.error(f"Fout bij verwerken MQTT bericht: {e}")
 
     def publish_ha_discovery(self):
         """Publiceer de Home Assistant MQTT Autodiscovery payloads."""
@@ -202,19 +256,20 @@ class ModbusMqttBridge:
             unit = s.get("unit_of_measurement", "")
             dev_class = s.get("device_class", "")
             state_class = s.get("state_class", "")
+            entity_type = s.get("entity_type", "sensor")
 
             if not uid or not name:
                 continue
 
-            discovery_topic = f"{disc_prefix}/sensor/{uid}/config"
-            state_topic = f"{topic_prefix}/sensor/{uid}/state"
+            discovery_topic = f"{disc_prefix}/{entity_type}/{uid}/config"
+            state_topic = f"{topic_prefix}/{entity_type}/{uid}/state"
+            cmd_topic = f"{topic_prefix}/{entity_type}/{uid}/set"
 
             # Autodiscovery payload conform Home Assistant standaarden
             payload = {
                 "name": name,
                 "unique_id": uid,
                 "state_topic": state_topic,
-                "value_template": "{{ value_json.value }}",
                 "device": {
                     "identifiers": ["modbus_usr_n580_bridge"],
                     "name": "Modbus USR-N580 Bridge",
@@ -223,15 +278,34 @@ class ModbusMqttBridge:
                 }
             }
 
-            if unit:
-                payload["unit_of_measurement"] = unit
-            if dev_class:
-                payload["device_class"] = dev_class
-            if state_class:
-                payload["state_class"] = state_class
+            if entity_type == "switch":
+                payload["value_template"] = "{{ 'ON' if value_json.value == 1 else 'OFF' }}"
+                payload["command_topic"] = cmd_topic
+                payload["payload_on"] = "ON"
+                payload["payload_off"] = "OFF"
+            elif entity_type == "number":
+                payload["value_template"] = "{{ value_json.value }}"
+                payload["command_topic"] = cmd_topic
+                # Bepaal limieten op basis van sensornaam/type
+                if "temp" in uid or "temperatuur" in name.lower():
+                    payload["min"] = s.get("min", 15.0)
+                    payload["max"] = s.get("max") or s.get("max_value") or 45.0
+                    payload["step"] = s.get("step", 1.0)
+                else:
+                    payload["min"] = s.get("min", 0.0)
+                    payload["max"] = s.get("max") or s.get("max_value") or 100.0
+                    payload["step"] = s.get("step", 1.0)
+            else: # "sensor"
+                payload["value_template"] = "{{ value_json.value }}"
+                if unit:
+                    payload["unit_of_measurement"] = unit
+                if dev_class:
+                    payload["device_class"] = dev_class
+                if state_class:
+                    payload["state_class"] = state_class
 
             try:
-                mqtt_logger.debug(f"HA Discovery payload voor {uid}: {json.dumps(payload)}")
+                mqtt_logger.debug(f"HA Discovery payload voor {uid} ({entity_type}): {json.dumps(payload)}")
                 self.mqtt_client.publish(discovery_topic, json.dumps(payload), retain=True)
             except Exception as e:
                 mqtt_logger.error(f"Fout bij publiceren discovery voor {uid}: {e}")
@@ -248,8 +322,15 @@ class ModbusMqttBridge:
             mqtt_logger.warning(f"MQTT niet verbonden. Waarde voor {unique_id} overgeslagen.")
             return
 
+        # Zoek het entiteitstype voor het juiste topic
+        entity_type = "sensor"
+        for s in self.config.get("sensors", []):
+            if s.get("unique_id") == unique_id:
+                entity_type = s.get("entity_type", "sensor")
+                break
+
         topic_prefix = self.config.get("mqtt", {}).get("topic_prefix", "usr_n580_bridge")
-        state_topic = f"{topic_prefix}/sensor/{unique_id}/state"
+        state_topic = f"{topic_prefix}/{entity_type}/{unique_id}/state"
         payload = json.dumps({"value": value})
 
         try:
@@ -257,6 +338,75 @@ class ModbusMqttBridge:
             self.mqtt_client.publish(state_topic, payload)
         except Exception as e:
             mqtt_logger.error(f"Fout bij publiceren status voor {unique_id}: {e}")
+
+    def write_sensor(self, sensor, payload):
+        """Schrijf een waarde naar Modbus op basis van de MQTT payload."""
+        uid = sensor.get("unique_id")
+        slave = sensor.get("slave", 1)
+        address = sensor.get("address", 0)
+        scale = sensor.get("scale", 1.0)
+        entity_type = sensor.get("entity_type", "sensor")
+        
+        modbus_logger.info(f"Schrijven naar {uid} (Slave {slave}, Adres {address}): Payload = {payload}")
+        
+        # 1. Converteer payload naar modbus integer waarde
+        try:
+            if entity_type == "switch":
+                payload_clean = payload.strip().upper()
+                if payload_clean in ("ON", "1", "TRUE"):
+                    val = 1
+                elif payload_clean in ("OFF", "0", "FALSE"):
+                    val = 0
+                else:
+                    val = int(payload)
+            else:
+                # Converteer naar float en pas inverse scaling toe
+                float_val = float(payload)
+                val = int(round(float_val / scale))
+                
+            # Zorg dat de waarde in een 16-bits register past (handling signed/unsigned int16)
+            if sensor.get("data_type", "int16") == "int16" and val < 0:
+                val += 65536
+                
+            val = max(0, min(65535, val))
+            
+        except ValueError as e:
+            modbus_logger.error(f"Kan payload '{payload}' niet converteren naar Modbus waarde voor {uid}: {e}")
+            return
+            
+        # 2. Modbus verbinding controleren/tot stand brengen
+        if not self.modbus_client or not self.modbus_client.connected:
+            modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
+            if not self.connect_modbus():
+                return
+                
+        # 3. Schrijf naar het Modbus register
+        try:
+            if self.dry_run:
+                modbus_logger.info(f"[DRY-RUN] Schrijven naar register {address} op slave {slave} met waarde {val}")
+                self.publish_sensor_value(uid, float(payload) if entity_type != "switch" else (1 if val == 1 else 0))
+                return
+                
+            # Alleen holding registers kunnen geschreven worden in Modbus
+            reg_type = sensor.get("register_type", "holding")
+            if reg_type != "holding":
+                modbus_logger.error(f"Fout: Alleen holding registers zijn schrijfbaar (sensor {uid} heeft type {reg_type})")
+                return
+                
+            res = self.modbus_client.write_register(address=address, value=val, device_id=slave)
+            if res.isError():
+                modbus_logger.error(f"Fout bij schrijven naar Modbus voor {uid}: {res}")
+            else:
+                modbus_logger.info(f"Succesvol geschreven naar Modbus voor {uid}: Raw {val}")
+                # Direct de nieuwe status terug publiceren naar MQTT zodat de UI meteen geüpdatet wordt!
+                time.sleep(0.2)
+                actual_val = self.read_sensor(sensor)
+                if actual_val is not None:
+                    self.publish_sensor_value(uid, actual_val)
+                    
+        except Exception as e:
+            modbus_logger.error(f"Exception bij schrijven naar Modbus voor {uid}: {e}")
+
 
     # --------------------------------------------------------------------------
     # Modbus Functionaliteiten
