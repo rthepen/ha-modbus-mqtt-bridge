@@ -196,7 +196,7 @@ sensors:
     slave: 51
     register_type: "input"
     address: 1
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -208,7 +208,7 @@ sensors:
     slave: 51
     register_type: "input"
     address: 35
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -220,7 +220,7 @@ sensors:
     slave: 51
     register_type: "input"
     address: 53
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -232,7 +232,7 @@ sensors:
     slave: 51
     register_type: "input"
     address: 55
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -563,7 +563,7 @@ sensors:
     slave: 52
     register_type: "input"
     address: 1
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -575,7 +575,7 @@ sensors:
     slave: 52
     register_type: "input"
     address: 35
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -587,7 +587,7 @@ sensors:
     slave: 52
     register_type: "input"
     address: 53
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -599,7 +599,7 @@ sensors:
     slave: 52
     register_type: "input"
     address: 55
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -930,7 +930,7 @@ sensors:
     slave: 53
     register_type: "input"
     address: 1
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -942,7 +942,7 @@ sensors:
     slave: 53
     register_type: "input"
     address: 35
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -954,7 +954,7 @@ sensors:
     slave: 53
     register_type: "input"
     address: 53
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -966,7 +966,7 @@ sensors:
     slave: 53
     register_type: "input"
     address: 55
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -1297,7 +1297,7 @@ sensors:
     slave: 54
     register_type: "input"
     address: 1
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -1309,7 +1309,7 @@ sensors:
     slave: 54
     register_type: "input"
     address: 35
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -1321,7 +1321,7 @@ sensors:
     slave: 54
     register_type: "input"
     address: 53
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -1333,7 +1333,7 @@ sensors:
     slave: 54
     register_type: "input"
     address: 55
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -1664,7 +1664,7 @@ sensors:
     slave: 55
     register_type: "input"
     address: 1
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -1676,7 +1676,7 @@ sensors:
     slave: 55
     register_type: "input"
     address: 35
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "W"
@@ -1688,7 +1688,7 @@ sensors:
     slave: 55
     register_type: "input"
     address: 53
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"
@@ -1700,7 +1700,7 @@ sensors:
     slave: 55
     register_type: "input"
     address: 55
-    data_type: "int16"
+    data_type: "uint32"
     scale: 0.1
     precision: 1
     unit_of_measurement: "kWh"

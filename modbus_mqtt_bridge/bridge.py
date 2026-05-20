@@ -605,10 +605,11 @@ class ModbusMqttBridge:
         modbus_logger.debug(f"Lezen van {uid} (Slave: {slave}, Type: {reg_type}, Adres: {address})")
 
         try:
+            count = 2 if sensor.get("data_type") in ("int32", "uint32") else 1
             if reg_type == "holding":
-                res = self.modbus_client.read_holding_registers(address=address, count=1, device_id=slave)
+                res = self.modbus_client.read_holding_registers(address=address, count=count, device_id=slave)
             elif reg_type == "input":
-                res = self.modbus_client.read_input_registers(address=address, count=1, device_id=slave)
+                res = self.modbus_client.read_input_registers(address=address, count=count, device_id=slave)
             else:
                 modbus_logger.error(f"Onbekend register type: {reg_type} voor {uid}")
                 return None
@@ -619,17 +620,24 @@ class ModbusMqttBridge:
                     self.modbus_client.close()
                 return None
 
-            # Interpreteer de waarde (meestal een signed int16)
-            raw_value = res.registers[0]
-            
-            # Verwerk signed integers handmatig indien int16
-            if sensor.get("data_type", "int16") == "int16" and raw_value >= 32768:
-                raw_value -= 65536
+            # Interpreteer de waarde (meestal een signed int16 of 32-bits int/uint)
+            if count == 2:
+                # Modbus 32-bits combineert twee 16-bits registers (High Word eerst / Big-Endian)
+                raw_value = (res.registers[0] << 16) | res.registers[1]
+                if sensor.get("data_type") == "int32" and raw_value >= 2147483648:
+                    raw_value -= 4294967296
+                debug_raw = f"{res.registers[0]},{res.registers[1]} ({raw_value})"
+            else:
+                raw_value = res.registers[0]
+                # Verwerk signed integers handmatig indien int16
+                if sensor.get("data_type", "int16") == "int16" and raw_value >= 32768:
+                    raw_value -= 65536
+                debug_raw = str(res.registers[0])
 
             # Toepassen van schaling en precisie
             calculated_value = round(raw_value * scale, precision) if precision > 0 else int(round(raw_value * scale))
             
-            modbus_logger.debug(f"Gelezen {uid}: Raw={res.registers[0]} -> Berekend={calculated_value}")
+            modbus_logger.debug(f"Gelezen {uid}: Raw={debug_raw} -> Berekend={calculated_value}")
             return calculated_value
 
         except Exception as e:
