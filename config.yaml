@@ -203,6 +203,78 @@ sensors:
     device_class: "power"
     state_class: "measurement"
 
+  - name: "Growatt Inverter 51 PV1 Spanning"
+    unique_id: "growatt_vpv1_51"
+    slave: 51
+    register_type: "input"
+    address: 3
+    data_type: "uint16"
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: "V"
+    device_class: "voltage"
+    state_class: "measurement"
+
+  - name: "Growatt Inverter 51 PV1 Stroom"
+    unique_id: "growatt_ipv1_51"
+    slave: 51
+    register_type: "input"
+    address: 4
+    data_type: "uint16"
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: "A"
+    device_class: "current"
+    state_class: "measurement"
+
+  - name: "Growatt Inverter 51 PV1 Vermogen"
+    unique_id: "growatt_ppv1_51"
+    slave: 51
+    register_type: "input"
+    address: 5
+    data_type: "uint32"
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: "W"
+    device_class: "power"
+    state_class: "measurement"
+
+  - name: "Growatt Inverter 51 PV2 Spanning"
+    unique_id: "growatt_vpv2_51"
+    slave: 51
+    register_type: "input"
+    address: 7
+    data_type: "uint16"
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: "V"
+    device_class: "voltage"
+    state_class: "measurement"
+
+  - name: "Growatt Inverter 51 PV2 Stroom"
+    unique_id: "growatt_ipv2_51"
+    slave: 51
+    register_type: "input"
+    address: 8
+    data_type: "uint16"
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: "A"
+    device_class: "current"
+    state_class: "measurement"
+
+  - name: "Growatt Inverter 51 PV2 Vermogen"
+    unique_id: "growatt_ppv2_51"
+    slave: 51
+    register_type: "input"
+    address: 9
+    data_type: "uint32"
+    scale: 0.1
+    precision: 1
+    unit_of_measurement: "W"
+    device_class: "power"
+    state_class: "measurement"
+
   - name: "Growatt Inverter 51 Uitgangsvermogen"
     unique_id: "growatt_pac_51"
     slave: 51
