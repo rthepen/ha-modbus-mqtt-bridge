@@ -905,6 +905,72 @@ class ModbusMqttBridge:
         """Genereer de HTML-pagina voor het status dashboard."""
         return HTML_TEMPLATE.replace("{{INGRESS_PATH}}", ingress_path)
 
+    def reload_configuration(self, new_yaml_content):
+        """Valideer de ingevoerde YAML, schrijf deze naar config.yaml en herlaad verbindingen."""
+        try:
+            parsed_config = yaml.safe_load(new_yaml_content)
+            if not isinstance(parsed_config, dict):
+                raise ValueError("Configuratie moet een YAML dictionary/object zijn.")
+        except Exception as e:
+            raise ValueError(f"Fout bij parsen van YAML: {e}")
+
+        # Schrijf naar bestand
+        with open(self.config_path, 'w', encoding='utf-8') as f:
+            f.write(new_yaml_content)
+
+        logger.info(f"Configuratiebestand '{self.config_path}' bijgewerkt via Web UI. Hot-reloading...")
+
+        # Bewaar oude netwerkconfiguratie om te vergelijken
+        old_mqtt = self.config.get("mqtt", {})
+        old_modbus = self.config.get("modbus", {})
+
+        # Herlaad configuratie in geheugen
+        self.load_config()
+
+        # Vergelijk MQTT instellingen en herstart verbinding indien nodig
+        new_mqtt = self.config.get("mqtt", {})
+        mqtt_changed = (
+            old_mqtt.get("broker") != new_mqtt.get("broker") or
+            old_mqtt.get("port") != new_mqtt.get("port") or
+            old_mqtt.get("username") != new_mqtt.get("username") or
+            old_mqtt.get("password") != new_mqtt.get("password") or
+            old_mqtt.get("topic_prefix") != new_mqtt.get("topic_prefix")
+        )
+
+        if mqtt_changed and not self.dry_run:
+            mqtt_logger.info("MQTT configuratie gewijzigd via Web UI. Opnieuw verbinden...")
+            if self.mqtt_client:
+                try:
+                    self.mqtt_client.loop_stop()
+                    self.mqtt_client.disconnect()
+                except Exception as e:
+                    mqtt_logger.debug(f"Fout bij afsluiten MQTT verbinding: {e}")
+            self.setup_mqtt()
+
+        # Vergelijk Modbus instellingen en herstart verbinding indien nodig
+        new_modbus = self.config.get("modbus", {})
+        modbus_changed = (
+            old_modbus.get("host") != new_modbus.get("host") or
+            old_modbus.get("port") != new_modbus.get("port") or
+            old_modbus.get("timeout") != new_modbus.get("timeout")
+        )
+
+        if modbus_changed and not self.dry_run:
+            modbus_logger.info("Modbus configuratie gewijzigd via Web UI. Opnieuw verbinden...")
+            if self.modbus_client:
+                try:
+                    self.modbus_client.close()
+                except Exception as e:
+                    modbus_logger.debug(f"Fout bij sluiten Modbus client: {e}")
+            self.connect_modbus()
+
+        # Re-publiceer Home Assistant Discovery met eventueel nieuwe sensoren
+        if not self.dry_run and self.mqtt_connected:
+            mqtt_logger.info("Re-publiceren Home Assistant Discovery voor nieuwe/gewijzigde sensoren...")
+            self.publish_ha_discovery()
+
+        logger.info("Configuratie live herladen voltooid!")
+
     def terminate(self):
         """Zet de vlag om de daemon te stoppen."""
         self.running = False
@@ -934,7 +1000,7 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Ingress-Path")
         self.end_headers()
 
@@ -947,6 +1013,17 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             status_data = self.server.bridge.get_status_json()
             self.wfile.write(json.dumps(status_data).encode('utf-8'))
+        elif path.endswith("/api/config"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/yaml; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            try:
+                with open(self.server.bridge.config_path, 'r', encoding='utf-8') as f:
+                    config_content = f.read()
+            except Exception as e:
+                config_content = f"# Fout bij lezen van bestand: {e}"
+            self.wfile.write(config_content.encode('utf-8'))
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -958,6 +1035,29 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 
             html_content = self.server.bridge.get_status_html(ingress_path=ingress_path)
             self.wfile.write(html_content.encode('utf-8'))
+
+    def do_POST(self):
+        path = self.path
+        if path.endswith("/api/config"):
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                self.server.bridge.reload_configuration(post_data)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True, "message": "Configuratie succesvol bijgewerkt en herladen!"}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
 
 
 # ==============================================================================
@@ -1015,7 +1115,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 2rem;
+            margin-bottom: 1.5rem;
             padding-bottom: 1.5rem;
             border-bottom: 1px solid var(--card-border);
         }
@@ -1059,6 +1159,46 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             border: 1px solid rgba(239, 68, 68, 0.2);
         }
         .badge-danger::before { background-color: var(--danger); }
+        
+        /* Navigation Tabs */
+        .nav-tabs {
+            display: flex;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+            border-bottom: 1px solid var(--card-border);
+            padding-bottom: 1px;
+        }
+        
+        .tab-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            padding: 0.75rem 1.5rem;
+            font-size: 1rem;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: color 0.2s, border-color 0.2s;
+            outline: none;
+        }
+        
+        .tab-btn:hover {
+            color: var(--text-color);
+        }
+        
+        .tab-btn.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
         
         .grid {
             display: grid;
@@ -1163,6 +1303,94 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: var(--text-muted);
         }
         
+        /* Editor Elements */
+        .editor-container {
+            display: flex;
+            flex-direction: column;
+            gap: 1.25rem;
+        }
+        
+        .yaml-textarea {
+            width: 100%;
+            height: 550px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--card-border);
+            border-radius: 12px;
+            color: #e5e7eb;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            padding: 1.25rem;
+            resize: vertical;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+        
+        .yaml-textarea:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 10px var(--primary-glow);
+        }
+        
+        .editor-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 0.5rem;
+        }
+        
+        .btn {
+            padding: 0.75rem 1.75rem;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            border: none;
+            outline: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .btn-primary {
+            background-color: var(--primary);
+            color: #fff;
+        }
+        
+        .btn-primary:hover {
+            background-color: #2563eb;
+        }
+        
+        .btn-primary:active {
+            transform: scale(0.98);
+        }
+        
+        .alert-box {
+            padding: 1rem 1.25rem;
+            border-radius: 12px;
+            font-weight: 500;
+            display: flex;
+            align-items: flex-start;
+            gap: 0.75rem;
+            border: 1px solid transparent;
+            margin-bottom: 1.5rem;
+        }
+        
+        .alert-box-success {
+            background-color: var(--success-glow);
+            color: var(--success);
+            border-color: rgba(16, 185, 129, 0.2);
+        }
+        
+        .alert-box-danger {
+            background-color: var(--danger-glow);
+            color: var(--danger);
+            border-color: rgba(239, 68, 68, 0.2);
+            white-space: pre-wrap;
+            font-family: monospace;
+            font-size: 0.9rem;
+        }
+        
         .footer {
             margin-top: 3rem;
             text-align: center;
@@ -1182,63 +1410,174 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <span class="badge badge-danger">Laden...</span>
             </div>
         </header>
+
+        <div class="nav-tabs">
+            <button id="btn-tab-dashboard" class="tab-btn active" onclick="switchTab('dashboard')">📊 Status Dashboard</button>
+            <button id="btn-tab-editor" class="tab-btn" onclick="switchTab('editor')">📝 Configuratie Editor</button>
+        </div>
         
-        <div class="grid">
-            <div class="card">
-                <div class="card-title">Uptime</div>
-                <div class="card-value" id="uptime-val">-</div>
-            </div>
-            <div class="card">
-                <div class="card-title">Modbus Gateway</div>
-                <div class="card-value" id="modbus-val" style="font-size: 1.4rem;">-</div>
-                <div id="modbus-status-badge" style="margin-top: 0.5rem;"></div>
-            </div>
-            <div class="card">
-                <div class="card-title">MQTT Connection</div>
-                <div class="card-value" id="mqtt-val" style="font-size: 1.4rem;">-</div>
-                <div id="mqtt-status-badge" style="margin-top: 0.5rem;"></div>
-            </div>
-            <div class="card">
-                <div class="card-title">Statistieken (Polls)</div>
-                <div class="card-value" id="stats-val" style="font-size: 1.3rem;">
-                    Success: <span id="stats-success" style="color: var(--success);">0</span> 
-                    | Fouten: <span id="stats-failed" style="color: var(--danger);">0</span>
+        <!-- Tab 1: Dashboard -->
+        <div id="tab-dashboard" class="tab-content active">
+            <div class="grid">
+                <div class="card">
+                    <div class="card-title">Uptime</div>
+                    <div class="card-value" id="uptime-val">-</div>
                 </div>
-                <div style="margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-muted);">
-                    Totaal rondes: <span id="stats-total">0</span>
+                <div class="card">
+                    <div class="card-title">Modbus Gateway</div>
+                    <div class="card-value" id="modbus-val" style="font-size: 1.4rem;">-</div>
+                    <div id="modbus-status-badge" style="margin-top: 0.5rem;"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">MQTT Connection</div>
+                    <div class="card-value" id="mqtt-val" style="font-size: 1.4rem;">-</div>
+                    <div id="mqtt-status-badge" style="margin-top: 0.5rem;"></div>
+                </div>
+                <div class="card">
+                    <div class="card-title">Statistieken (Polls)</div>
+                    <div class="card-value" id="stats-val" style="font-size: 1.3rem;">
+                        Success: <span id="stats-success" style="color: var(--success);">0</span> 
+                        | Fouten: <span id="stats-failed" style="color: var(--danger);">0</span>
+                    </div>
+                    <div style="margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-muted);">
+                        Totaal rondes: <span id="stats-total">0</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div id="buffer-alert-container"></div>
+            
+            <div class="section-title">📊 Live Sensor Waarden</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Naam / ID</th>
+                        <th>Slave</th>
+                        <th>Huidige Waarde</th>
+                        <th>Laatst Geüpdatet</th>
+                    </tr>
+                </thead>
+                <tbody id="sensor-table-body">
+                    <tr>
+                        <td colspan="4" class="text-center">Gegevens laden...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Tab 2: Editor -->
+        <div id="tab-editor" class="tab-content">
+            <div class="editor-container">
+                <div class="section-title">📝 Wijzig config.yaml</div>
+                <div id="editor-alert-container"></div>
+                <textarea id="config-textarea" class="yaml-textarea" spellcheck="false" placeholder="# Laden van configuratie..."></textarea>
+                <div class="editor-actions">
+                    <span id="editor-status-text" style="color: var(--text-muted); font-size: 0.9rem;"></span>
+                    <button class="btn btn-primary" onclick="saveConfiguration()">💾 Opslaan & Toepassen</button>
                 </div>
             </div>
         </div>
         
-        <div id="buffer-alert-container"></div>
-        
-        <div class="section-title">📊 Live Sensor Waarden</div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Naam / ID</th>
-                    <th>Slave</th>
-                    <th>Huidige Waarde</th>
-                    <th>Laatst Geüpdatet</th>
-                </tr>
-            </thead>
-            <tbody id="sensor-table-body">
-                <tr>
-                    <td colspan="4" class="text-center">Gegevens laden...</td>
-                </tr>
-            </tbody>
-        </table>
-        
         <div class="footer">
-            Modbus-MQTT Bridge Add-on v1.0.13 • Ontwikkeld voor Raspberry Pi & Home Assistant
+            Modbus-MQTT Bridge Add-on v1.0.14 • Ontwikkeld voor Raspberry Pi & Home Assistant
         </div>
     </div>
 
     <script>
         const ingressPath = "{{INGRESS_PATH}}";
         const apiURL = ingressPath + "/api/status";
+        const configURL = ingressPath + "/api/config";
+        
+        let activeTab = 'dashboard';
+        
+        function switchTab(tabId) {
+            activeTab = tabId;
+            
+            // Buttons class
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.getElementById(`btn-tab-${tabId}`).classList.add('active');
+            
+            // Contents class
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            document.getElementById(`tab-${tabId}`).classList.add('active');
+            
+            if (tabId === 'editor') {
+                loadConfiguration();
+            }
+        }
+        
+        function loadConfiguration() {
+            const statusText = document.getElementById('editor-status-text');
+            statusText.innerText = "Bezig met inladen van bestand...";
+            
+            fetch(configURL)
+                .then(response => {
+                    if (!response.ok) throw new Error("Fout status code: " + response.status);
+                    return response.text();
+                })
+                .then(yaml => {
+                    document.getElementById('config-textarea').value = yaml;
+                    statusText.innerText = "Configuratie succesvol geladen.";
+                    document.getElementById('editor-alert-container').innerHTML = '';
+                })
+                .catch(err => {
+                    console.error("Fout bij inladen config:", err);
+                    statusText.innerText = "Laden mislukt.";
+                    document.getElementById('editor-alert-container').innerHTML = `
+                        <div class="alert-box alert-box-danger">
+                            <strong>❌ Kan config.yaml niet laden:</strong>\\n${err.message || err}
+                        </div>
+                    `;
+                });
+        }
+        
+        function saveConfiguration() {
+            const statusText = document.getElementById('editor-status-text');
+            const alertContainer = document.getElementById('editor-alert-container');
+            const yamlContent = document.getElementById('config-textarea').value;
+            
+            statusText.innerText = "Opslaan en valideren...";
+            alertContainer.innerHTML = '';
+            
+            fetch(configURL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'text/plain'
+                },
+                body: yamlContent
+            })
+            .then(response => response.json().then(data => ({ status: response.status, data })))
+            .then(({ status, data }) => {
+                if (status === 200 && data.success) {
+                    statusText.innerText = "Configuratie succesvol herladen!";
+                    alertContainer.innerHTML = `
+                        <div class="alert-box alert-box-success">
+                            <strong>✅ Succes:</strong> ${data.message}
+                        </div>
+                    `;
+                } else {
+                    statusText.innerText = "Toepassen mislukt.";
+                    alertContainer.innerHTML = `
+                        <div class="alert-box alert-box-danger">
+                            <strong>❌ Validatie- / Toepassingsfout:</strong>\\n${data.error || 'Onbekende fout'}
+                        </div>
+                    `;
+                }
+            })
+            .catch(err => {
+                console.error("Netwerkfout bij opslaan:", err);
+                statusText.innerText = "Verbindingsfout.";
+                alertContainer.innerHTML = `
+                    <div class="alert-box alert-box-danger">
+                        <strong>❌ Netwerkfout bij opslaan:</strong>\\n${err.message || err}
+                    </div>
+                `;
+            });
+        }
         
         function updateDashboard() {
+            if (activeTab !== 'dashboard') return;
+            
             fetch(apiURL)
                 .then(response => response.json())
                 .then(data => {
