@@ -1228,7 +1228,19 @@ class ModbusMqttBridge:
 
     def get_status_html(self, ingress_path=""):
         """Genereer de HTML-pagina voor het status dashboard."""
-        return HTML_TEMPLATE.replace("{{INGRESS_PATH}}", ingress_path)
+        # Lees versie dynamisch uit de addon config.yaml
+        version = "?"
+        try:
+            import re
+            addon_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+            if os.path.exists(addon_cfg):
+                with open(addon_cfg, 'r') as f:
+                    m = re.search(r'^version:\s*["\']?([\d.]+)["\']?', f.read(), re.MULTILINE)
+                    if m:
+                        version = m.group(1)
+        except Exception:
+            pass
+        return HTML_TEMPLATE.replace("{{INGRESS_PATH}}", ingress_path).replace("{{VERSION}}", version)
 
     def run_slave_benchmark(self, slave_id, task_id=None):
         """Voert een uitgebreide stress-test uit op een specifieke slave om de optimale grouping en delay te bepalen."""
@@ -1745,6 +1757,8 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
             self.end_headers()
             
             ingress_path = self.headers.get("X-Ingress-Path", "")
@@ -2421,7 +2435,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         
         <div class="footer">
-            Modbus-MQTT Bridge Add-on v1.0.14 • Ontwikkeld voor Raspberry Pi & Home Assistant
+            Modbus-MQTT Bridge Add-on v{{VERSION}} • Ontwikkeld voor Raspberry Pi &amp; Home Assistant
         </div>
     </div>
 
