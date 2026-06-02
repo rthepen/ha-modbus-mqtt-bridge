@@ -1711,8 +1711,8 @@ class StatusHTTPServer(ThreadingHTTPServer):
 
 class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Override om de stdout logs schoon te houden
-        logger.debug(f"HTTP Server: {format % args}")
+        # Log HTTP-verzoeken op INFO niveau voor debug doeleinden
+        logger.info(f"[HTTP] {format % args}")
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -3245,8 +3245,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         function updateDashboard() {
             if (activeTab !== 'dashboard') return;
             
-            fetch(apiURL)
-                .then(response => response.json())
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8000);
+            
+            fetch(apiURL, { signal: controller.signal })
+                .then(response => {
+                    clearTimeout(timeoutId);
+                    return response.json();
+                })
                 .then(data => {
                     // Update status badge
                     const statusBadge = document.getElementById('bridge-status-badge');
@@ -3317,8 +3323,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     }
                 })
                 .catch(err => {
-                    console.error("Fout bij ophalen status:", err);
-                    document.getElementById('bridge-status-badge').innerHTML = '<span class="badge badge-danger">Fout bij laden</span>';
+                    const errType = err.name === 'AbortError' ? 'Timeout (>8s)' : err.message || err.name;
+                    console.error("Fout bij ophalen status:", errType, "URL:", apiURL);
+                    document.getElementById('bridge-status-badge').innerHTML = 
+                        `<span class="badge badge-danger" title="${apiURL}: ${errType}">Fout: ${errType}</span>`;
+                    document.getElementById('uptime-val').innerText = apiURL;
                 });
         }
         
