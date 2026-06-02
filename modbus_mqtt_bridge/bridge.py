@@ -70,6 +70,7 @@ class ModbusMqttBridge:
         self.mqtt_client = None
         self.mqtt_connected = False
         self.slave_states = {}  # Track connectivity status per slave
+        self.last_published_values = {}  # Track last published values per sensor
         self.is_addon = False
 
         if self.debug:
@@ -346,14 +347,12 @@ class ModbusMqttBridge:
             slave = s.get("slave", 1)
             dev_name, dev_id = self.get_device_info_by_slave(slave)
 
-            # Autodiscovery payload conform Home Assistant standaarden met beschikbaarheidsbinding
+            # Autodiscovery payload conform Home Assistant standaarden (zonder beschikbaarheidsbinding
+            # zodat sensoren hun laatste waarde behouden als de verbinding wegvalt)
             payload = {
                 "name": name,
                 "unique_id": uid,
                 "state_topic": state_topic,
-                "availability_topic": f"{topic_prefix}/binary_sensor/{dev_id}_connectivity/state",
-                "payload_available": "ON",
-                "payload_not_available": "OFF",
                 "device": {
                     "identifiers": [f"modbus_usr_n580_device_{dev_id}"],
                     "name": dev_name,
@@ -432,11 +431,20 @@ class ModbusMqttBridge:
             except (ValueError, TypeError):
                 pass
 
+        # Controleer of de waarde veranderd is ten opzichte van de vorige keer
+        if getattr(self, "last_published_values", None) is None:
+            self.last_published_values = {}
+
+        if self.last_published_values.get(unique_id) == pub_value:
+            mqtt_logger.debug(f"Waarde voor {unique_id} is ongewijzigd ({pub_value}). Publiceren overgeslagen.")
+            return
+
         payload = json.dumps({"value": pub_value})
 
         try:
-            mqtt_logger.debug(f"Publiceer: {state_topic} -> {payload}")
+            mqtt_logger.info(f"Publiceer: {state_topic} -> {payload}")
             self.mqtt_client.publish(state_topic, payload)
+            self.last_published_values[unique_id] = pub_value
         except Exception as e:
             mqtt_logger.error(f"Fout bij publiceren status voor {unique_id}: {e}")
 
