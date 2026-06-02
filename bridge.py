@@ -1726,6 +1726,11 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
         path = parsed_url.path
         query = parse_qs(parsed_url.query)
         
+        # Log binnenkomende headers voor diagnose
+        ingress_path = self.headers.get("X-Ingress-Path", "")
+        ingress_path_raw = self.headers.get("X-Ingress-Path", "NIET_AANWEZIG")
+        logger.info(f"[HTTP-DEBUG] GET {path} | X-Ingress-Path={ingress_path_raw!r} | Host={self.headers.get('Host','?')!r}")
+        
         if path.endswith("/api/status"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -2440,7 +2445,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <script>
-        const ingressPath = "{{INGRESS_PATH}}";
+        // Server-side injected ingress path (may be empty if header was missing)
+        let _serverIngressPath = "{{INGRESS_PATH}}";
+        
+        // Auto-detect ingress path from browser URL as reliable fallback
+        // HA Ingress URLs follow pattern: /api/hassio_ingress/TOKEN/...
+        function detectIngressPath() {
+            if (_serverIngressPath && _serverIngressPath !== "{{INGRESS_PATH}}") {
+                return _serverIngressPath;
+            }
+            // Extract /api/hassio_ingress/TOKEN from window.location.pathname
+            const match = window.location.pathname.match(/^(\/api\/hassio_ingress\/[^\/]+)/);
+            if (match) return match[1];
+            // Also check if it's an app URL redirect - look at the page URL
+            const appMatch = window.location.href.match(/\/api\/hassio_ingress\/([^\/]+)/);
+            if (appMatch) return '/api/hassio_ingress/' + appMatch[1];
+            return "";
+        }
+        
+        const ingressPath = detectIngressPath();
         const apiURL = ingressPath + "/api/status";
         const configURL = ingressPath + "/api/config";
         
