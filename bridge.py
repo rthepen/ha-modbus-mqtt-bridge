@@ -2445,25 +2445,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <script>
-        // Server-side injected ingress path (may be empty if header was missing)
-        let _serverIngressPath = "{{INGRESS_PATH}}";
-        
-        // Auto-detect ingress path from browser URL as reliable fallback
-        // HA Ingress URLs follow pattern: /api/hassio_ingress/TOKEN/...
-        function detectIngressPath() {
-            if (_serverIngressPath && _serverIngressPath !== "{{INGRESS_PATH}}") {
-                return _serverIngressPath;
+        // Bereken de basis-URL vanuit de huidig geladen pagina-URL
+        // HA Ingress serveert de pagina op /api/hassio_ingress/TOKEN/
+        // Relatieve URLs t.o.v. de paginabasis werken automatisch correct
+        function getApiBase() {
+            // Haal de URL op waarvandaan de pagina geladen is
+            const pageUrl = window.location.href;
+            // Verwijder alles na de laatste / om de basis te krijgen
+            const base = pageUrl.replace(/\/[^\/]*(\?.*)?$/, '/');
+            // Controleer of dit een HA ingress URL is
+            if (base.includes('/api/hassio_ingress/')) {
+                return base.replace(/\/$/, '');  // zonder trailing slash
             }
-            // Extract /api/hassio_ingress/TOKEN from window.location.pathname
-            const match = window.location.pathname.match(/^(\/api\/hassio_ingress\/[^\/]+)/);
-            if (match) return match[1];
-            // Also check if it's an app URL redirect - look at the page URL
-            const appMatch = window.location.href.match(/\/api\/hassio_ingress\/([^\/]+)/);
-            if (appMatch) return '/api/hassio_ingress/' + appMatch[1];
-            return "";
+            // Fallback: gebruik server-side injectie
+            return "{{INGRESS_PATH}}";
         }
         
-        const ingressPath = detectIngressPath();
+        const ingressPath = getApiBase();
         const apiURL = ingressPath + "/api/status";
         const configURL = ingressPath + "/api/config";
         
