@@ -17,6 +17,10 @@ import logging
 import threading
 import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    ThreadingHTTPServer = HTTPServer
 from pymodbus.client import ModbusTcpClient
 from pymodbus.framer import FramerType
 import paho.mqtt.client as mqtt
@@ -698,64 +702,65 @@ class ModbusMqttBridge:
 
     def read_sensor(self, sensor):
         """Lees een specifieke sensor uit via Modbus."""
-        if not self.modbus_client or not self.modbus_client.connected:
-            modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
-            if not self.connect_modbus():
-                return None
+        with self.modbus_lock:
+            if not self.modbus_client or not self.modbus_client.connected:
+                modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
+                if not self.connect_modbus():
+                    return None
 
-        slave = sensor.get("slave", 1)
-        reg_type = sensor.get("register_type", "holding")
-        address = sensor.get("address", 0)
-        scale = sensor.get("scale", 1.0)
-        precision = sensor.get("precision", 0)
-        uid = sensor.get("unique_id", "unknown")
+            slave = sensor.get("slave", 1)
+            reg_type = sensor.get("register_type", "holding")
+            address = sensor.get("address", 0)
+            scale = sensor.get("scale", 1.0)
+            precision = sensor.get("precision", 0)
+            uid = sensor.get("unique_id", "unknown")
 
-        modbus_logger.debug(f"Lezen van {uid} (Slave: {slave}, Type: {reg_type}, Adres: {address})")
+            modbus_logger.debug(f"Lezen van {uid} (Slave: {slave}, Type: {reg_type}, Adres: {address})")
 
-        try:
-            count = 2 if sensor.get("data_type") in ("int32", "uint32") else 1
-            if reg_type == "holding":
-                res = self.modbus_client.read_holding_registers(address=address, count=count, device_id=slave)
-            elif reg_type == "input":
-                res = self.modbus_client.read_input_registers(address=address, count=count, device_id=slave)
-            else:
-                modbus_logger.error(f"Onbekend register type: {reg_type} voor {uid}")
-                return None
+            try:
+                count = 2 if sensor.get("data_type") in ("int32", "uint32") else 1
+                if reg_type == "holding":
+                    res = self.modbus_client.read_holding_registers(address=address, count=count, device_id=slave)
+                elif reg_type == "input":
+                    res = self.modbus_client.read_input_registers(address=address, count=count, device_id=slave)
+                else:
+                    modbus_logger.error(f"Onbekend register type: {reg_type} voor {uid}")
+                    return None
 
-            if res.isError():
-                modbus_logger.error(f"Fout bij uitlezen {uid} (Slave {slave}, Adres {address}): {res}")
+                if res.isError():
+                    modbus_logger.error(f"Fout bij uitlezen {uid} (Slave {slave}, Adres {address}): {res}")
+                    if self.modbus_client:
+                        self.modbus_client.close()
+                    return None
+
+                # Interpreteer de waarde (meestal een signed int16 of 32-bits int/uint)
+                if count == 2:
+                    # Modbus 32-bits combineert twee 16-bits registers (High Word eerst / Big-Endian)
+                    raw_value = (res.registers[0] << 16) | res.registers[1]
+                    if sensor.get("data_type") == "int32" and raw_value >= 2147483648:
+                        raw_value -= 4294967296
+                    debug_raw = f"{res.registers[0]},{res.registers[1]} ({raw_value})"
+                else:
+                    raw_value = res.registers[0]
+                    # Verwerk signed integers handmatig indien int16
+                    if sensor.get("data_type", "int16") == "int16" and raw_value >= 32768:
+                        raw_value -= 65536
+                    debug_raw = str(res.registers[0])
+
+                # Toepassen van schaling en precisie
+                calculated_value = round(raw_value * scale, precision) if precision > 0 else int(round(raw_value * scale))
+                
+                modbus_logger.debug(f"Gelezen {uid}: Raw={debug_raw} -> Berekend={calculated_value}")
+                return calculated_value
+
+            except Exception as e:
+                modbus_logger.error(f"Exception bij uitlezen {uid}: {e}")
                 if self.modbus_client:
-                    self.modbus_client.close()
+                    try:
+                        self.modbus_client.close()
+                    except Exception:
+                        pass
                 return None
-
-            # Interpreteer de waarde (meestal een signed int16 of 32-bits int/uint)
-            if count == 2:
-                # Modbus 32-bits combineert twee 16-bits registers (High Word eerst / Big-Endian)
-                raw_value = (res.registers[0] << 16) | res.registers[1]
-                if sensor.get("data_type") == "int32" and raw_value >= 2147483648:
-                    raw_value -= 4294967296
-                debug_raw = f"{res.registers[0]},{res.registers[1]} ({raw_value})"
-            else:
-                raw_value = res.registers[0]
-                # Verwerk signed integers handmatig indien int16
-                if sensor.get("data_type", "int16") == "int16" and raw_value >= 32768:
-                    raw_value -= 65536
-                debug_raw = str(res.registers[0])
-
-            # Toepassen van schaling en precisie
-            calculated_value = round(raw_value * scale, precision) if precision > 0 else int(round(raw_value * scale))
-            
-            modbus_logger.debug(f"Gelezen {uid}: Raw={debug_raw} -> Berekend={calculated_value}")
-            return calculated_value
-
-        except Exception as e:
-            modbus_logger.error(f"Exception bij uitlezen {uid}: {e}")
-            if self.modbus_client:
-                try:
-                    self.modbus_client.close()
-                except Exception:
-                    pass
-            return None
 
     # --------------------------------------------------------------------------
     # Hoofd Polling Loop
@@ -856,51 +861,52 @@ class ModbusMqttBridge:
 
     def read_block(self, block):
         """Lees een heel Modbus-blok uit."""
-        slave = block["slave"]
-        reg_type = block["register_type"]
-        start_addr = block["start"]
-        count = block["end"] - start_addr + 1
+        with self.modbus_lock:
+            slave = block["slave"]
+            reg_type = block["register_type"]
+            start_addr = block["start"]
+            count = block["end"] - start_addr + 1
 
-        modbus_logger.debug(f"Blok inlezen (Slave: {slave}, Type: {reg_type}, Adres: {start_addr}, Aantal: {count})")
+            modbus_logger.debug(f"Blok inlezen (Slave: {slave}, Type: {reg_type}, Adres: {start_addr}, Aantal: {count})")
 
-        # Modbus verbinding controleren/herstellen
-        if not self.modbus_client or not self.modbus_client.connected:
-            modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
-            if not self.connect_modbus():
-                return None
+            # Modbus verbinding controleren/herstellen
+            if not self.modbus_client or not self.modbus_client.connected:
+                modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
+                if not self.connect_modbus():
+                    return None
 
-        try:
-            if reg_type == "holding":
-                res = self.modbus_client.read_holding_registers(address=start_addr, count=count, device_id=slave)
-            elif reg_type == "input":
-                res = self.modbus_client.read_input_registers(address=start_addr, count=count, device_id=slave)
-            else:
-                modbus_logger.error(f"Onbekend register type: {reg_type} voor blok")
-                return None
+            try:
+                if reg_type == "holding":
+                    res = self.modbus_client.read_holding_registers(address=start_addr, count=count, device_id=slave)
+                elif reg_type == "input":
+                    res = self.modbus_client.read_input_registers(address=start_addr, count=count, device_id=slave)
+                else:
+                    modbus_logger.error(f"Onbekend register type: {reg_type} voor blok")
+                    return None
 
-            if res.isError():
-                modbus_logger.error(f"Fout bij uitlezen blok (Slave {slave}, Adres {start_addr}, Aantal {count}): {res}")
+                if res.isError():
+                    modbus_logger.error(f"Fout bij uitlezen blok (Slave {slave}, Adres {start_addr}, Aantal {count}): {res}")
+                    if self.modbus_client:
+                        self.modbus_client.close()
+                    return None
+
+                return res.registers
+
+            except Exception as e:
+                modbus_logger.error(f"Exception bij uitlezen blok: {e}")
                 if self.modbus_client:
-                    self.modbus_client.close()
+                    try:
+                        self.modbus_client.close()
+                    except Exception:
+                        pass
                 return None
-
-            return res.registers
-
-        except Exception as e:
-            modbus_logger.error(f"Exception bij uitlezen blok: {e}")
-            if self.modbus_client:
-                try:
-                    self.modbus_client.close()
-                except Exception:
-                    pass
-            return None
 
     # --------------------------------------------------------------------------
     # Hoofd Polling Loop
     # --------------------------------------------------------------------------
     def poll_all_sensors(self):
         """Lees alle sensoren uit via geoptimaliseerde blokken met fallback."""
-        with self.modbus_lock:
+        if True:
             if not hasattr(self, "sensor_blocks") or not self.sensor_blocks:
                 self.group_sensors()
                 if not self.sensor_blocks:
@@ -1418,7 +1424,7 @@ class ModbusMqttBridge:
 # ==============================================================================
 # Ingress HTTP Server & Handler
 # ==============================================================================
-class StatusHTTPServer(HTTPServer):
+class StatusHTTPServer(ThreadingHTTPServer):
     def __init__(self, server_address, RequestHandlerClass, bridge):
         super().__init__(server_address, RequestHandlerClass)
         self.bridge = bridge

@@ -1,5 +1,5 @@
 name: "Modbus to MQTT Bridge"
-version: "1.0.18"
+version: "1.0.19"
 slug: "modbus_mqtt_bridge"
 description: "Bridge Modbus RTU-over-TCP devices to Home Assistant via MQTT"
 arch:
