@@ -1,5 +1,5 @@
 name: "Modbus to MQTT Bridge"
-version: "1.0.13"
+version: "1.0.14"
 slug: "modbus_mqtt_bridge"
 description: "Bridge Modbus RTU-over-TCP devices to Home Assistant via MQTT"
 arch:
@@ -10,6 +10,8 @@ arch:
   - i386
 startup: services
 boot: auto
+ingress: true
+ingress_port: 8099
 options:
   mqtt_broker: "192.168.50.106"
   mqtt_port: 1883
@@ -20,6 +22,7 @@ options:
   modbus_host: "192.168.50.96"
   modbus_port: 41
   poll_interval: 15
+  log_level: "info"
 schema:
   mqtt_broker: str
   mqtt_port: int
@@ -30,3 +33,5 @@ schema:
   modbus_host: str
   modbus_port: int
   poll_interval: int
+  log_level: "list(debug|info|warning|error)"
+

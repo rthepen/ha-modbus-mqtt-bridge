@@ -19,4 +19,5 @@ COPY run.sh .
 RUN chmod +x run.sh
 
 # Start commando
+EXPOSE 8099
 CMD [ "./run.sh" ]

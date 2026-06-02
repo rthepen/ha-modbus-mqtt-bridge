@@ -14,6 +14,9 @@ import signal
 import argparse
 import json
 import logging
+import threading
+import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pymodbus.client import ModbusTcpClient
 from pymodbus.framer import FramerType
 import paho.mqtt.client as mqtt
@@ -72,6 +75,13 @@ class ModbusMqttBridge:
         self.slave_states = {}  # Track connectivity status per slave
         self.last_published_values = {}  # Track last published values per sensor
         self.is_addon = False
+        
+        # Statistieken & status tracking voor dashboard
+        self.start_time = time.time()
+        self.stats = {"total_polls": 0, "successful_reads": 0, "failed_reads": 0}
+        self.sensor_values = {}  # unique_id -> {"value": val, "timestamp": str}
+        self.mqtt_buffer = {}  # topic -> (payload, retain)
+        self.buffer_lock = threading.Lock()
 
         if self.debug:
             logger.setLevel(logging.DEBUG)
@@ -86,6 +96,9 @@ class ModbusMqttBridge:
 
         # Inlezen van configuratie
         self.load_config()
+        
+        # Start de status HTTP Ingress server
+        self.start_http_server()
 
     def get_device_info_by_slave(self, slave):
         """Bepaal apparaatnaam en identifiers op basis van slave ID."""
@@ -132,6 +145,7 @@ class ModbusMqttBridge:
                         "timeout": 3,
                         "poll_interval": ha_options.get("poll_interval", 15)
                     },
+                    "log_level": ha_options.get("log_level", "info"),
                     "sensors": []
                 }
                 
@@ -152,23 +166,39 @@ class ModbusMqttBridge:
 
                 self.is_addon = True
                 logger.info("Addon opties succesvol ingeladen en getransformeerd!")
-                return
             except Exception as e:
                 logger.error(f"Fout bij inlezen Home Assistant opties: {e}")
                 sys.exit(1)
+        else:
+            logger.info(f"Configuratie inlezen van: {self.config_path}")
+            if not os.path.exists(self.config_path):
+                logger.error(f"Configuratiebestand niet gevonden op: {self.config_path}")
+                sys.exit(1)
+            
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    self.config = yaml.safe_load(f)
+                logger.info("Configuratie succesvol ingeladen!")
+            except Exception as e:
+                logger.error(f"Fout bij parsen van YAML: {e}")
+                sys.exit(1)
 
-        logger.info(f"Configuratie inlezen van: {self.config_path}")
-        if not os.path.exists(self.config_path):
-            logger.error(f"Configuratiebestand niet gevonden op: {self.config_path}")
-            sys.exit(1)
-        
-        try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                self.config = yaml.safe_load(f)
-            logger.info("Configuratie succesvol ingeladen!")
-        except Exception as e:
-            logger.error(f"Fout bij parsen van YAML: {e}")
-            sys.exit(1)
+        # Configureer loggers gebaseerd op log_level uit de config, tenzij debug op CLI is meegegeven
+        if not self.debug:
+            log_level_str = str(self.config.get("log_level", "info")).upper()
+            numeric_level = getattr(logging, log_level_str, logging.INFO)
+            
+            logger.setLevel(numeric_level)
+            modbus_logger.setLevel(numeric_level)
+            mqtt_logger.setLevel(numeric_level)
+            
+            # Pymodbus debug is erg luidruchtig, toon dat alleen bij DEBUG
+            if numeric_level == logging.DEBUG:
+                logging.getLogger("pymodbus").setLevel(logging.DEBUG)
+            else:
+                logging.getLogger("pymodbus").setLevel(logging.WARNING)
+            
+            logger.info(f"Log-level ingesteld op: {log_level_str}")
 
     # --------------------------------------------------------------------------
     # MQTT Functionaliteiten
@@ -237,6 +267,9 @@ class ModbusMqttBridge:
                     
             # Direct HA Discovery uitvoeren om entiteiten aan te maken/vernieuwen
             self.publish_ha_discovery()
+            
+            # Verzend alle gebufferde berichten
+            self.flush_mqtt_buffer()
         else:
             mqtt_logger.error(f"MQTT Verbinding mislukt met code: {rc}")
 
@@ -405,10 +438,6 @@ class ModbusMqttBridge:
             logger.info(f"[DRY-RUN] Publiceren {unique_id} -> {value}")
             return
 
-        if not self.mqtt_connected:
-            mqtt_logger.warning(f"MQTT niet verbonden. Waarde voor {unique_id} overgeslagen.")
-            return
-
         # Zoek het entiteitstype voor het juiste topic
         entity_type = "sensor"
         options = []
@@ -430,6 +459,19 @@ class ModbusMqttBridge:
                     pub_value = options[idx]
             except (ValueError, TypeError):
                 pass
+
+        # Update de status cache voor de REST API en Dashboard
+        self.sensor_values[unique_id] = {
+            "value": pub_value,
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        # Bufferen indien MQTT offline is
+        if not self.mqtt_connected:
+            with self.buffer_lock:
+                self.mqtt_buffer[state_topic] = (json.dumps({"value": pub_value}), False)
+            mqtt_logger.debug(f"MQTT offline. Waarde voor {unique_id} ({pub_value}) gebufferd.")
+            return
 
         # Controleer of de waarde veranderd is ten opzichte van de vorige keer
         if getattr(self, "last_published_values", None) is None:
@@ -454,25 +496,33 @@ class ModbusMqttBridge:
             logger.info(f"[DRY-RUN] Publiceren connectiviteit Slave {slave} -> {status}")
             return
 
-        if not self.mqtt_connected:
-            mqtt_logger.warning(f"MQTT niet verbonden. Connectiviteit voor Slave {slave} overgeslagen.")
-            return
-
         if getattr(self, "slave_states", None) is None:
             self.slave_states = {}
         
-        if self.slave_states.get(slave) == status:
-            return
-
+        # Wijzig status cache voor API
         self.slave_states[slave] = status
 
         _, dev_id = self.get_device_info_by_slave(slave)
         topic_prefix = self.config.get("mqtt", {}).get("topic_prefix", "usr_n580_bridge")
         state_topic = f"{topic_prefix}/binary_sensor/{dev_id}_connectivity/state"
-        
+
+        # Bufferen indien MQTT offline is
+        if not self.mqtt_connected:
+            with self.buffer_lock:
+                self.mqtt_buffer[state_topic] = (status, True)
+            mqtt_logger.debug(f"MQTT offline. Status voor slave {slave} ({status}) gebufferd.")
+            return
+
+        if not hasattr(self, "last_published_slave_states"):
+            self.last_published_slave_states = {}
+
+        if self.last_published_slave_states.get(slave) == status:
+            return
+
         try:
             mqtt_logger.info(f"Slave {slave} is nu {status}. Publiceer naar {state_topic}")
             self.mqtt_client.publish(state_topic, status, retain=True)
+            self.last_published_slave_states[slave] = status
         except Exception as e:
             mqtt_logger.error(f"Fout bij publiceren connectiviteit voor Slave {slave}: {e}")
 
@@ -665,6 +715,8 @@ class ModbusMqttBridge:
         sensors = self.config.get("sensors", [])
         logger.info(f"Starten pollingronde voor {len(sensors)} sensoren...")
         
+        self.stats["total_polls"] += 1
+        
         failed_slaves = set()
         success_count = 0
         slaves_marked_online = set()
@@ -676,6 +728,7 @@ class ModbusMqttBridge:
             # Sla over als deze slave al gemarkeerd is als mislukt in deze pollingronde
             if slave in failed_slaves:
                 modbus_logger.debug(f"Sla {uid} over omdat Slave {slave} in deze ronde al gefaald is.")
+                self.stats["failed_reads"] += 1
                 continue
                 
             val = self.read_sensor(s)
@@ -683,6 +736,7 @@ class ModbusMqttBridge:
             if val is not None:
                 self.publish_sensor_value(uid, val)
                 success_count += 1
+                self.stats["successful_reads"] += 1
                 
                 # Markeer als online als we dat nog niet hebben gedaan in deze ronde
                 if slave not in slaves_marked_online:
@@ -692,6 +746,7 @@ class ModbusMqttBridge:
                 # Markeer als mislukt zodat we overige registers voor deze slave overslaan in deze ronde
                 failed_slaves.add(slave)
                 self.publish_slave_connectivity(slave, "OFF")
+                self.stats["failed_reads"] += 1
                 modbus_logger.warning(f"Slave {slave} reageert niet. Resterende sensors voor deze slave in deze pollingronde worden overgeslagen.")
                 
             # Wacht heel even tussen verzoeken om bus-collisies op de RS485-lijn te minimaliseren
@@ -767,9 +822,509 @@ class ModbusMqttBridge:
             self.mqtt_client.disconnect()
         logger.info("Bridge is volledig afgesloten. Tot ziens!")
 
+    def flush_mqtt_buffer(self):
+        """Verzend alle gebufferde berichten naar de MQTT broker."""
+        with self.buffer_lock:
+            if not self.mqtt_buffer:
+                return
+            mqtt_logger.info(f"MQTT verbinding hersteld. {len(self.mqtt_buffer)} gebufferde berichten verzenden...")
+            buffer_copy = dict(self.mqtt_buffer)
+            self.mqtt_buffer.clear()
+
+        for topic, (payload, retain) in buffer_copy.items():
+            try:
+                mqtt_logger.debug(f"Verzenden gebufferd bericht: {topic} -> {payload} (retain={retain})")
+                self.mqtt_client.publish(topic, payload, retain=retain)
+            except Exception as e:
+                mqtt_logger.error(f"Fout bij verzenden gebufferd bericht op {topic}: {e}")
+                with self.buffer_lock:
+                    self.mqtt_buffer[topic] = (payload, retain)
+
+    def start_http_server(self):
+        """Start de Ingress HTTP status server in een aparte thread."""
+        try:
+            port = 8099
+            self.http_server = StatusHTTPServer(('0.0.0.0', port), StatusHTTPRequestHandler, self)
+            self.http_thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+            self.http_thread.start()
+            logger.info(f"Ingress HTTP status server gestart op poort {port}")
+        except Exception as e:
+            logger.error(f"Kan Ingress HTTP server niet starten: {e}")
+
+    def get_status_json(self):
+        """Genereer een JSON status representatie van de daemon."""
+        with self.buffer_lock:
+            buffer_size = len(self.mqtt_buffer)
+        
+        uptime = int(time.time() - self.start_time)
+        days = uptime // 86400
+        hours = (uptime % 86400) // 3600
+        minutes = (uptime % 3600) // 60
+        seconds = uptime % 60
+        
+        uptime_parts = []
+        if days > 0: uptime_parts.append(f"{days}d")
+        if hours > 0: uptime_parts.append(f"{hours}h")
+        if minutes > 0: uptime_parts.append(f"{minutes}m")
+        uptime_parts.append(f"{seconds}s")
+        uptime_str = " ".join(uptime_parts)
+
+        sensor_list = []
+        for s in self.config.get("sensors", []):
+            uid = s.get("unique_id")
+            name = s.get("name")
+            slave = s.get("slave", 1)
+            val_data = self.sensor_values.get(uid, {"value": "Nog geen meting", "timestamp": "-"})
+            sensor_list.append({
+                "unique_id": uid,
+                "name": name,
+                "slave": slave,
+                "value": val_data["value"],
+                "timestamp": val_data["timestamp"],
+                "unit": s.get("unit_of_measurement", "")
+            })
+
+        return {
+            "status": "running" if self.running else "stopped",
+            "uptime": uptime_str,
+            "mqtt": {
+                "connected": self.mqtt_connected,
+                "broker": self.config.get("mqtt", {}).get("broker", "localhost"),
+                "buffer_size": buffer_size
+            },
+            "modbus": {
+                "connected": self.modbus_client.connected if (self.modbus_client and hasattr(self.modbus_client, "connected")) else False,
+                "host": self.config.get("modbus", {}).get("host", "localhost")
+            },
+            "stats": self.stats,
+            "slave_states": self.slave_states,
+            "sensors": sensor_list
+        }
+
+    def get_status_html(self, ingress_path=""):
+        """Genereer de HTML-pagina voor het status dashboard."""
+        return HTML_TEMPLATE.replace("{{INGRESS_PATH}}", ingress_path)
+
     def terminate(self):
         """Zet de vlag om de daemon te stoppen."""
         self.running = False
+        if hasattr(self, "http_server"):
+            logger.info("Ingress HTTP server stoppen...")
+            try:
+                self.http_server.shutdown()
+                self.http_server.server_close()
+            except Exception as e:
+                logger.error(f"Fout bij stoppen HTTP server: {e}")
+
+
+# ==============================================================================
+# Ingress HTTP Server & Handler
+# ==============================================================================
+class StatusHTTPServer(HTTPServer):
+    def __init__(self, server_address, RequestHandlerClass, bridge):
+        super().__init__(server_address, RequestHandlerClass)
+        self.bridge = bridge
+
+
+class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Override om de stdout logs schoon te houden
+        logger.debug(f"HTTP Server: {format % args}")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Ingress-Path")
+        self.end_headers()
+
+    def do_GET(self):
+        path = self.path
+        if path.endswith("/api/status"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            status_data = self.server.bridge.get_status_json()
+            self.wfile.write(json.dumps(status_data).encode('utf-8'))
+        else:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            
+            ingress_path = self.headers.get("X-Ingress-Path", "")
+            if ingress_path.endswith("/"):
+                ingress_path = ingress_path[:-1]
+                
+            html_content = self.server.bridge.get_status_html(ingress_path=ingress_path)
+            self.wfile.write(html_content.encode('utf-8'))
+
+
+# ==============================================================================
+# Status Dashboard HTML Sjabloon (Premium Dark Glassmorphism)
+# ==============================================================================
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Modbus-MQTT Bridge Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --card-bg: rgba(255, 255, 255, 0.03);
+            --card-border: rgba(255, 255, 255, 0.07);
+            --text-color: #f3f4f6;
+            --text-muted: #9ca3af;
+            --primary: #3b82f6;
+            --primary-glow: rgba(59, 130, 246, 0.15);
+            --success: #10b981;
+            --success-glow: rgba(16, 185, 129, 0.15);
+            --danger: #ef4444;
+            --danger-glow: rgba(239, 68, 68, 0.15);
+            --warning: #f59e0b;
+        }
+        
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+        
+        body {
+            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.6;
+            padding: 2rem;
+            min-height: 100vh;
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(59, 130, 246, 0.05) 0px, transparent 50%),
+                radial-gradient(at 100% 0%, rgba(16, 185, 129, 0.05) 0px, transparent 50%);
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--card-border);
+        }
+        
+        h1 {
+            font-size: 2rem;
+            font-weight: 800;
+            background: linear-gradient(135deg, #fff 0%, #a5b4fc 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .badge {
+            padding: 0.35rem 0.75rem;
+            border-radius: 9999px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+        
+        .badge::before {
+            content: '';
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        
+        .badge-success {
+            background-color: var(--success-glow);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.2);
+        }
+        .badge-success::before { background-color: var(--success); }
+        
+        .badge-danger {
+            background-color: var(--danger-glow);
+            color: var(--danger);
+            border: 1px solid rgba(239, 68, 68, 0.2);
+        }
+        .badge-danger::before { background-color: var(--danger); }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 1.5rem;
+            margin-bottom: 2.5rem;
+        }
+        
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+            transition: transform 0.2s, border-color 0.2s;
+        }
+        
+        .card:hover {
+            transform: translateY(-2px);
+            border-color: rgba(255, 255, 255, 0.12);
+        }
+        
+        .card-title {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 0.75rem;
+            font-weight: 600;
+        }
+        
+        .card-value {
+            font-size: 1.8rem;
+            font-weight: 800;
+            display: flex;
+            align-items: baseline;
+            gap: 0.5rem;
+        }
+        
+        .card-value span {
+            font-size: 1rem;
+            font-weight: 400;
+            color: var(--text-muted);
+        }
+        
+        .section-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-bottom: 1.25rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: var(--card-bg);
+            border: 1px solid var(--card-border);
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+        }
+        
+        th, td {
+            padding: 1rem 1.25rem;
+            text-align: left;
+        }
+        
+        th {
+            background-color: rgba(255, 255, 255, 0.02);
+            font-weight: 600;
+            color: var(--text-muted);
+            border-bottom: 1px solid var(--card-border);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+        
+        tr:not(:last-child) td {
+            border-bottom: 1px solid var(--card-border);
+        }
+        
+        tr:hover td {
+            background-color: rgba(255, 255, 255, 0.01);
+        }
+        
+        .sensor-val {
+            font-family: monospace;
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #fff;
+        }
+        
+        .text-center {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+        
+        .footer {
+            margin-top: 3rem;
+            text-align: center;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div>
+                <h1>Modbus-MQTT Bridge</h1>
+                <p style="color: var(--text-muted); font-size: 0.9rem;">Status & Monitoring Console</p>
+            </div>
+            <div id="bridge-status-badge">
+                <span class="badge badge-danger">Laden...</span>
+            </div>
+        </header>
+        
+        <div class="grid">
+            <div class="card">
+                <div class="card-title">Uptime</div>
+                <div class="card-value" id="uptime-val">-</div>
+            </div>
+            <div class="card">
+                <div class="card-title">Modbus Gateway</div>
+                <div class="card-value" id="modbus-val" style="font-size: 1.4rem;">-</div>
+                <div id="modbus-status-badge" style="margin-top: 0.5rem;"></div>
+            </div>
+            <div class="card">
+                <div class="card-title">MQTT Connection</div>
+                <div class="card-value" id="mqtt-val" style="font-size: 1.4rem;">-</div>
+                <div id="mqtt-status-badge" style="margin-top: 0.5rem;"></div>
+            </div>
+            <div class="card">
+                <div class="card-title">Statistieken (Polls)</div>
+                <div class="card-value" id="stats-val" style="font-size: 1.3rem;">
+                    Success: <span id="stats-success" style="color: var(--success);">0</span> 
+                    | Fouten: <span id="stats-failed" style="color: var(--danger);">0</span>
+                </div>
+                <div style="margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-muted);">
+                    Totaal rondes: <span id="stats-total">0</span>
+                </div>
+            </div>
+        </div>
+        
+        <div id="buffer-alert-container"></div>
+        
+        <div class="section-title">📊 Live Sensor Waarden</div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Naam / ID</th>
+                    <th>Slave</th>
+                    <th>Huidige Waarde</th>
+                    <th>Laatst Geüpdatet</th>
+                </tr>
+            </thead>
+            <tbody id="sensor-table-body">
+                <tr>
+                    <td colspan="4" class="text-center">Gegevens laden...</td>
+                </tr>
+            </tbody>
+        </table>
+        
+        <div class="footer">
+            Modbus-MQTT Bridge Add-on v1.0.13 • Ontwikkeld voor Raspberry Pi & Home Assistant
+        </div>
+    </div>
+
+    <script>
+        const ingressPath = "{{INGRESS_PATH}}";
+        const apiURL = ingressPath + "/api/status";
+        
+        function updateDashboard() {
+            fetch(apiURL)
+                .then(response => response.json())
+                .then(data => {
+                    // Update status badge
+                    const statusBadge = document.getElementById('bridge-status-badge');
+                    if (data.status === 'running') {
+                        statusBadge.innerHTML = '<span class="badge badge-success">Actief</span>';
+                    } else {
+                        statusBadge.innerHTML = '<span class="badge badge-danger">Gestopt</span>';
+                    }
+                    
+                    // Update cards
+                    document.getElementById('uptime-val').innerText = data.uptime;
+                    
+                    document.getElementById('modbus-val').innerText = data.modbus.host;
+                    const modbusBadge = document.getElementById('modbus-status-badge');
+                    if (data.modbus.connected) {
+                        modbusBadge.innerHTML = '<span class="badge badge-success">Verbonden</span>';
+                    } else {
+                        modbusBadge.innerHTML = '<span class="badge badge-danger">Verbinding Verbroken</span>';
+                    }
+                    
+                    document.getElementById('mqtt-val').innerText = data.mqtt.broker;
+                    const mqttBadge = document.getElementById('mqtt-status-badge');
+                    if (data.mqtt.connected) {
+                        mqttBadge.innerHTML = '<span class="badge badge-success">Verbonden</span>';
+                    } else {
+                        mqttBadge.innerHTML = '<span class="badge badge-danger">Offline</span>';
+                    }
+                    
+                    // Stats
+                    document.getElementById('stats-success').innerText = data.stats.successful_reads;
+                    document.getElementById('stats-failed').innerText = data.stats.failed_reads;
+                    document.getElementById('stats-total').innerText = data.stats.total_polls;
+                    
+                    // Buffer Alert
+                    const bufferContainer = document.getElementById('buffer-alert-container');
+                    if (data.mqtt.buffer_size > 0) {
+                        bufferContainer.innerHTML = `
+                            <div class="card" style="border-color: var(--warning); background-color: rgba(245, 158, 11, 0.05); margin-bottom: 2rem; padding: 1rem;">
+                                <span style="color: var(--warning); font-weight: 600;">⚠️ MQTT offline waarschuwing:</span> 
+                                Er staan momenteel <strong>${data.mqtt.buffer_size}</strong> berichten in de wachtrij. 
+                                Deze worden verzonden zodra de verbinding hersteld is.
+                            </div>
+                        `;
+                    } else {
+                        bufferContainer.innerHTML = '';
+                    }
+                    
+                    // Sensor Table
+                    const tbody = document.getElementById('sensor-table-body');
+                    if (data.sensors.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="4" class="text-center">Geen sensoren geconfigureerd.</td></tr>';
+                    } else {
+                        let html = '';
+                        data.sensors.forEach(s => {
+                            html += `
+                                <tr>
+                                    <td>
+                                        <div style="font-weight: 600;">${s.name}</div>
+                                        <div style="font-size: 0.8rem; color: var(--text-muted); font-family: monospace;">${s.unique_id}</div>
+                                    </td>
+                                    <td><span class="badge" style="background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff;">Slave ${s.slave}</span></td>
+                                    <td><span class="sensor-val">${s.value} ${s.unit}</span></td>
+                                    <td style="color: var(--text-muted); font-size: 0.9rem;">${s.timestamp}</td>
+                                </tr>
+                            `;
+                        });
+                        tbody.innerHTML = html;
+                    }
+                })
+                .catch(err => {
+                    console.error("Fout bij ophalen status:", err);
+                    document.getElementById('bridge-status-badge').innerHTML = '<span class="badge badge-danger">Fout bij laden</span>';
+                });
+        }
+        
+        // Initial call
+        updateDashboard();
+        // Periodieke verversing elke 5 seconden
+        setInterval(updateDashboard, 5000);
+    </script>
+</body>
+</html>
+"""
+
 
 
 # ==============================================================================
