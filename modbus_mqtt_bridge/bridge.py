@@ -82,6 +82,7 @@ class ModbusMqttBridge:
         self.sensor_values = {}  # unique_id -> {"value": val, "timestamp": str}
         self.mqtt_buffer = {}  # topic -> (payload, retain)
         self.buffer_lock = threading.Lock()
+        self.modbus_lock = threading.RLock()
 
         if self.debug:
             logger.setLevel(logging.DEBUG)
@@ -177,7 +178,9 @@ class ModbusMqttBridge:
                         "retries": local_modbus.get("retries") or ha_options.get("retries", 3),
                         "delay_between_requests": local_modbus.get("delay_between_requests") or ha_options.get("delay_between_requests", 0.1),
                         "max_gap": local_modbus.get("max_gap") or ha_options.get("max_gap", 10),
-                        "slave_retries": local_modbus.get("slave_retries") or ha_options.get("slave_retries", {})
+                        "slave_retries": local_modbus.get("slave_retries") or ha_options.get("slave_retries", {}),
+                        "slave_max_gaps": local_modbus.get("slave_max_gaps") or {},
+                        "slave_delays": local_modbus.get("slave_delays") or {}
                     },
                     "log_level": local_cfg.get("log_level") or ha_options.get("log_level", "info"),
                     "sensors": local_cfg.get("sensors") or ha_options.get("sensors", [])
@@ -207,6 +210,8 @@ class ModbusMqttBridge:
         modbus_cfg.setdefault("delay_between_requests", 0.1)
         modbus_cfg.setdefault("max_gap", 10)
         modbus_cfg.setdefault("slave_retries", {})
+        modbus_cfg.setdefault("slave_max_gaps", {})
+        modbus_cfg.setdefault("slave_delays", {})
 
         # Configureer loggers gebaseerd op log_level uit de config, tenzij debug op CLI is meegegeven
         if not self.debug:
@@ -600,66 +605,67 @@ class ModbusMqttBridge:
             return
             
         # 2. Modbus verbinding controleren/tot stand brengen
-        if not self.modbus_client or not self.modbus_client.connected:
-            modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
-            if not self.connect_modbus():
-                return
-                
-        # 3. Schrijf naar het Modbus register
-        try:
-            if self.dry_run:
-                modbus_logger.info(f"[DRY-RUN] Schrijven naar register {address} op slave {slave} met waarde {val}")
-                if entity_type == "switch":
-                    pub_val = 1 if val == 1 else 0
-                elif entity_type == "select":
-                    pub_val = val
-                else:
-                    pub_val = float(payload)
-                self.publish_sensor_value(uid, pub_val)
-                return
-                
-            # Alleen holding registers kunnen geschreven worden in Modbus
-            reg_type = sensor.get("register_type", "holding")
-            if reg_type != "holding":
-                modbus_logger.error(f"Fout: Alleen holding registers zijn schrijfbaar (sensor {uid} heeft type {reg_type})")
-                return
-                
-            max_retries = self.get_slave_retries(slave)
-            delay = float(self.config.get("modbus", {}).get("delay_between_requests", 0.1))
-            res = None
-            attempt = 0
-            while attempt <= max_retries:
-                if attempt > 0:
-                    modbus_logger.info(f"Retry {attempt}/{max_retries} voor schrijven naar register {address} op slave {slave} met waarde {val}...")
-                    time.sleep(delay)
-                try:
-                    res = self.modbus_client.write_register(address=address, value=val, device_id=slave)
-                    if res is not None and not res.isError():
-                        break
-                except Exception as e:
-                    modbus_logger.error(f"Fout bij schrijven naar Modbus (poging {attempt}): {e}")
-                    res = None
-                attempt += 1
-
-            if res is None or res.isError():
-                modbus_logger.error(f"Fout bij schrijven naar Modbus voor {uid}: {res}")
-                if self.modbus_client:
-                    self.modbus_client.close()
-            else:
-                modbus_logger.info(f"Succesvol geschreven naar Modbus voor {uid}: Raw {val}")
-                # Direct de nieuwe status terug publiceren naar MQTT zodat de UI meteen geüpdatet wordt!
-                time.sleep(0.2)
-                actual_val = self.read_sensor(sensor)
-                if actual_val is not None:
-                    self.publish_sensor_value(uid, actual_val)
+        with self.modbus_lock:
+            if not self.modbus_client or not self.modbus_client.connected:
+                modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
+                if not self.connect_modbus():
+                    return
                     
-        except Exception as e:
-            modbus_logger.error(f"Exception bij schrijven naar Modbus voor {uid}: {e}")
-            if self.modbus_client:
-                try:
-                    self.modbus_client.close()
-                except Exception:
-                    pass
+            # 3. Schrijf naar het Modbus register
+            try:
+                if self.dry_run:
+                    modbus_logger.info(f"[DRY-RUN] Schrijven naar register {address} op slave {slave} met waarde {val}")
+                    if entity_type == "switch":
+                        pub_val = 1 if val == 1 else 0
+                    elif entity_type == "select":
+                        pub_val = val
+                    else:
+                        pub_val = float(payload)
+                    self.publish_sensor_value(uid, pub_val)
+                    return
+                    
+                # Alleen holding registers kunnen geschreven worden in Modbus
+                reg_type = sensor.get("register_type", "holding")
+                if reg_type != "holding":
+                    modbus_logger.error(f"Fout: Alleen holding registers zijn schrijfbaar (sensor {uid} heeft type {reg_type})")
+                    return
+                    
+                max_retries = self.get_slave_retries(slave)
+                delay = float(self.config.get("modbus", {}).get("delay_between_requests", 0.1))
+                res = None
+                attempt = 0
+                while attempt <= max_retries:
+                    if attempt > 0:
+                        modbus_logger.info(f"Retry {attempt}/{max_retries} voor schrijven naar register {address} op slave {slave} met waarde {val}...")
+                        time.sleep(delay)
+                    try:
+                        res = self.modbus_client.write_register(address=address, value=val, device_id=slave)
+                        if res is not None and not res.isError():
+                            break
+                    except Exception as e:
+                        modbus_logger.error(f"Fout bij schrijven naar Modbus (poging {attempt}): {e}")
+                        res = None
+                    attempt += 1
+
+                if res is None or res.isError():
+                    modbus_logger.error(f"Fout bij schrijven naar Modbus voor {uid}: {res}")
+                    if self.modbus_client:
+                        self.modbus_client.close()
+                else:
+                    modbus_logger.info(f"Succesvol geschreven naar Modbus voor {uid}: Raw {val}")
+                    # Direct de nieuwe status terug publiceren naar MQTT zodat de UI meteen geüpdatet wordt!
+                    time.sleep(0.2)
+                    actual_val = self.read_sensor(sensor)
+                    if actual_val is not None:
+                        self.publish_sensor_value(uid, actual_val)
+                        
+            except Exception as e:
+                modbus_logger.error(f"Exception bij schrijven naar Modbus voor {uid}: {e}")
+                if self.modbus_client:
+                    try:
+                        self.modbus_client.close()
+                    except Exception:
+                        pass
 
 
     # --------------------------------------------------------------------------
@@ -765,7 +771,8 @@ class ModbusMqttBridge:
             return
 
         modbus_cfg = self.config.get("modbus", {})
-        max_gap = int(modbus_cfg.get("max_gap", 10))
+        global_max_gap = int(modbus_cfg.get("max_gap", 10))
+        slave_max_gaps = modbus_cfg.get("slave_max_gaps", {})
 
         # Groepeer sensoren per (slave, register_type)
         grouped = {}
@@ -780,6 +787,15 @@ class ModbusMqttBridge:
         self.sensor_blocks = []
 
         for (slave, reg_type), slave_sensors in grouped.items():
+            # Bepaal max_gap voor deze specifieke slave
+            slave_gap = slave_max_gaps.get(str(slave))
+            if slave_gap is None:
+                slave_gap = slave_max_gaps.get(int(slave))
+            if slave_gap is None:
+                slave_gap = global_max_gap
+            else:
+                slave_gap = int(slave_gap)
+
             sensor_ranges = []
             for s in slave_sensors:
                 addr = int(s.get("address", 0))
@@ -794,7 +810,7 @@ class ModbusMqttBridge:
             # Sorteer op start adres
             sensor_ranges.sort(key=lambda x: x["start"])
 
-            # Voeg samen tot blokken met een maximale kloof van `max_gap` en max block size van 120 registers
+            # Voeg samen tot blokken met een maximale kloof van `slave_gap` en max block size van 120 registers
             current_block = None
             for r in sensor_ranges:
                 if current_block is None:
@@ -809,7 +825,7 @@ class ModbusMqttBridge:
                     gap = r["start"] - current_block["end"] - 1
                     new_size = r["end"] - current_block["start"] + 1
                     
-                    if gap <= max_gap and new_size <= 120:
+                    if gap <= slave_gap and new_size <= 120:
                         current_block["end"] = max(current_block["end"], r["end"])
                         current_block["sensors"].append(r["sensor"])
                     else:
@@ -884,122 +900,133 @@ class ModbusMqttBridge:
     # --------------------------------------------------------------------------
     def poll_all_sensors(self):
         """Lees alle sensoren uit via geoptimaliseerde blokken met fallback."""
-        if not hasattr(self, "sensor_blocks") or not self.sensor_blocks:
-            self.group_sensors()
-            if not self.sensor_blocks:
-                logger.warning("Geen sensoren geconfigureerd om te polliceren.")
-                return
+        with self.modbus_lock:
+            if not hasattr(self, "sensor_blocks") or not self.sensor_blocks:
+                self.group_sensors()
+                if not self.sensor_blocks:
+                    logger.warning("Geen sensoren geconfigureerd om te polliceren.")
+                    return
 
-        modbus_cfg = self.config.get("modbus", {})
-        delay = float(modbus_cfg.get("delay_between_requests", 0.1))
-        
-        self.stats["total_polls"] += 1
-        logger.info(f"Starten pollingronde via {len(self.sensor_blocks)} Modbus-blokken...")
-
-        failed_slaves = set()
-        success_count = 0
-        slaves_marked_online = set()
-
-        for block in self.sensor_blocks:
-            slave = block["slave"]
-            reg_type = block["register_type"]
-            start_addr = block["start"]
-            block_sensors = block["sensors"]
-
-            # Sla het blok over als deze slave al gemarkeerd is als gefaald in deze ronde
-            if slave in failed_slaves:
-                self.stats["failed_reads"] += len(block_sensors)
-                continue
-
-            max_retries = self.get_slave_retries(slave)
+            modbus_cfg = self.config.get("modbus", {})
+            delay = float(modbus_cfg.get("delay_between_requests", 0.1))
             
-            registers = None
-            attempt = 0
-            
-            while attempt <= max_retries:
-                if attempt > 0:
-                    modbus_logger.info(f"Retry {attempt}/{max_retries} voor Blok (Slave {slave}, Adres {start_addr})...")
-                    time.sleep(delay)
+            self.stats["total_polls"] += 1
+            logger.info(f"Starten pollingronde via {len(self.sensor_blocks)} Modbus-blokken...")
 
-                registers = self.read_block(block)
-                if registers is not None:
-                    break
-                attempt += 1
+            failed_slaves = set()
+            success_count = 0
+            slaves_marked_online = set()
 
-            if registers is not None:
-                for s in block_sensors:
-                    uid = s.get("unique_id")
-                    addr = int(s.get("address", 0))
-                    count = 2 if s.get("data_type") in ("int32", "uint32") else 1
-                    
-                    offset = addr - start_addr
-                    
-                    if offset >= 0 and offset + count <= len(registers):
-                        sensor_regs = registers[offset : offset + count]
-                        
-                        if count == 2:
-                            raw_value = (sensor_regs[0] << 16) | sensor_regs[1]
-                            if s.get("data_type") == "int32" and raw_value >= 2147483648:
-                                raw_value -= 4294967296
-                            debug_raw = f"{sensor_regs[0]},{sensor_regs[1]} ({raw_value})"
-                        else:
-                            raw_value = sensor_regs[0]
-                            if s.get("data_type", "int16") == "int16" and raw_value >= 32768:
-                                raw_value -= 65536
-                            debug_raw = str(sensor_regs[0])
+            for block in self.sensor_blocks:
+                slave = block["slave"]
+                reg_type = block["register_type"]
+                start_addr = block["start"]
+                block_sensors = block["sensors"]
 
-                        scale = s.get("scale", 1.0)
-                        precision = s.get("precision", 0)
-                        calculated_value = round(raw_value * scale, precision) if precision > 0 else int(round(raw_value * scale))
-                        
-                        modbus_logger.debug(f"Gelezen {uid} via blok: Raw={debug_raw} -> Berekend={calculated_value}")
-                        self.publish_sensor_value(uid, calculated_value)
-                        success_count += 1
-                        self.stats["successful_reads"] += 1
-                    else:
-                        modbus_logger.error(f"Offset buiten bereik voor sensor {uid} in blok: offset={offset}, len={len(registers)}")
-                        self.stats["failed_reads"] += 1
+                # Sla het blok over als deze slave al gemarkeerd is als gefaald in deze ronde
+                if slave in failed_slaves:
+                    self.stats["failed_reads"] += len(block_sensors)
+                    continue
 
-                if slave not in slaves_marked_online:
-                    self.publish_slave_connectivity(slave, "ON")
-                    slaves_marked_online.add(slave)
-            else:
-                modbus_logger.warning(f"Blok uitlezen mislukt voor Slave {slave}, Adres {start_addr}. Fallback naar individuele sensoren...")
+                max_retries = self.get_slave_retries(slave)
                 
-                block_failed = False
-                for s in block_sensors:
-                    uid = s.get("unique_id")
-                    
-                    val = None
-                    indiv_attempt = 0
-                    while indiv_attempt <= max_retries:
-                        if indiv_attempt > 0:
-                            time.sleep(delay)
-                        val = self.read_sensor(s)
-                        if val is not None:
-                            break
-                        indiv_attempt += 1
-
-                    if val is not None:
-                        self.publish_sensor_value(uid, val)
-                        success_count += 1
-                        self.stats["successful_reads"] += 1
-                    else:
-                        block_failed = True
-                        self.stats["failed_reads"] += 1
-
-                if block_failed:
-                    failed_slaves.add(slave)
-                    self.publish_slave_connectivity(slave, "OFF")
-                    modbus_logger.warning(f"Slave {slave} reageert niet na individuele fallback. Resterende blokken voor deze slave worden overgeslagen.")
+                # Bepaal delay voor deze specifieke slave
+                slave_delays = modbus_cfg.get("slave_delays", {})
+                slave_delay = slave_delays.get(str(slave))
+                if slave_delay is None:
+                    slave_delay = slave_delays.get(int(slave))
+                if slave_delay is None:
+                    slave_delay = delay
                 else:
+                    slave_delay = float(slave_delay)
+
+                registers = None
+                attempt = 0
+                
+                while attempt <= max_retries:
+                    if attempt > 0:
+                        modbus_logger.info(f"Retry {attempt}/{max_retries} voor Blok (Slave {slave}, Adres {start_addr})...")
+                        time.sleep(slave_delay)
+
+                    registers = self.read_block(block)
+                    if registers is not None:
+                        break
+                    attempt += 1
+
+                if registers is not None:
+                    for s in block_sensors:
+                        uid = s.get("unique_id")
+                        addr = int(s.get("address", 0))
+                        count = 2 if s.get("data_type") in ("int32", "uint32") else 1
+                        
+                        offset = addr - start_addr
+                        
+                        if offset >= 0 and offset + count <= len(registers):
+                            sensor_regs = registers[offset : offset + count]
+                            
+                            if count == 2:
+                                raw_value = (sensor_regs[0] << 16) | sensor_regs[1]
+                                if s.get("data_type") == "int32" and raw_value >= 2147483648:
+                                    raw_value -= 4294967296
+                                debug_raw = f"{sensor_regs[0]},{sensor_regs[1]} ({raw_value})"
+                            else:
+                                raw_value = sensor_regs[0]
+                                if s.get("data_type", "int16") == "int16" and raw_value >= 32768:
+                                    raw_value -= 65536
+                                debug_raw = str(sensor_regs[0])
+
+                            scale = s.get("scale", 1.0)
+                            precision = s.get("precision", 0)
+                            calculated_value = round(raw_value * scale, precision) if precision > 0 else int(round(raw_value * scale))
+                            
+                            modbus_logger.debug(f"Gelezen {uid} via blok: Raw={debug_raw} -> Berekend={calculated_value}")
+                            self.publish_sensor_value(uid, calculated_value)
+                            success_count += 1
+                            self.stats["successful_reads"] += 1
+                        else:
+                            modbus_logger.error(f"Offset buiten bereik voor sensor {uid} in blok: offset={offset}, len={len(registers)}")
+                            self.stats["failed_reads"] += 1
+
                     if slave not in slaves_marked_online:
                         self.publish_slave_connectivity(slave, "ON")
                         slaves_marked_online.add(slave)
+                else:
+                    modbus_logger.warning(f"Blok uitlezen mislukt voor Slave {slave}, Adres {start_addr}. Fallback naar individuele sensoren...")
+                    
+                    block_failed = False
+                    for s in block_sensors:
+                        uid = s.get("unique_id")
+                        
+                        val = None
+                        indiv_attempt = 0
+                        while indiv_attempt <= max_retries:
+                            if indiv_attempt > 0:
+                                time.sleep(slave_delay)
+                            val = self.read_sensor(s)
+                            if val is not None:
+                                break
+                            indiv_attempt += 1
 
-            time.sleep(delay)
+                        if val is not None:
+                            self.publish_sensor_value(uid, val)
+                            success_count += 1
+                            self.stats["successful_reads"] += 1
+                        else:
+                            block_failed = True
+                            self.stats["failed_reads"] += 1
 
-        logger.info(f"Pollingronde voltooid. {success_count} metingen succesvol verwerkt.")
+                    if block_failed:
+                        failed_slaves.add(slave)
+                        self.publish_slave_connectivity(slave, "OFF")
+                        modbus_logger.warning(f"Slave {slave} reageert niet na individuele fallback. Resterende blokken voor deze slave worden overgeslagen.")
+                    else:
+                        if slave not in slaves_marked_online:
+                            self.publish_slave_connectivity(slave, "ON")
+                            slaves_marked_online.add(slave)
+
+                time.sleep(slave_delay)
+
+            logger.info(f"Pollingronde voltooid. {success_count} metingen succesvol verwerkt.")
 
     def run_once(self):
         """Voer één enkele polling uit en sluit af (handig voor testen/CLI)."""
@@ -1152,6 +1179,164 @@ class ModbusMqttBridge:
         """Genereer de HTML-pagina voor het status dashboard."""
         return HTML_TEMPLATE.replace("{{INGRESS_PATH}}", ingress_path)
 
+    def run_slave_benchmark(self, slave_id):
+        """Voert een uitgebreide stress-test uit op een specifieke slave om de optimale grouping en delay te bepalen."""
+        sensors = self.config.get("sensors", [])
+        slave_sensors = [s for s in sensors if int(s.get("slave", 1)) == slave_id]
+        if not slave_sensors:
+            return {"success": False, "error": f"Geen sensoren geconfigureerd voor Slave {slave_id}."}
+
+        logger.info(f"🏁 Starten van Modbus stress-test en optimalisatie voor Slave {slave_id} (Sensoren: {len(slave_sensors)})...")
+
+        # Test combinaties van max_gap en delay
+        test_gaps = [1, 2, 5, 10, 15, 20]
+        test_delays = [0.0, 0.02, 0.05, 0.1, 0.15]
+
+        best_cfg = None
+        best_duration = float('inf')
+        best_success_rate = 0.0
+        results = []
+
+        with self.modbus_lock:
+            # Sorteer sensoren op start-adres
+            sensor_ranges = []
+            for s in slave_sensors:
+                addr = int(s.get("address", 0))
+                count = 2 if s.get("data_type") in ("int32", "uint32") else 1
+                sensor_ranges.append({
+                    "sensor": s,
+                    "start": addr,
+                    "end": addr + count - 1,
+                    "count": count
+                })
+            sensor_ranges.sort(key=lambda x: x["start"])
+
+            for gap in test_gaps:
+                # Groepeer sensoren specifiek voor deze max_gap test
+                blocks = []
+                current_block = None
+                for r in sensor_ranges:
+                    if current_block is None:
+                        current_block = {
+                            "slave": slave_id,
+                            "register_type": r["sensor"].get("register_type", "holding"),
+                            "start": r["start"],
+                            "end": r["end"],
+                            "sensors": [r["sensor"]]
+                        }
+                    else:
+                        reg_type = r["sensor"].get("register_type", "holding")
+                        g = r["start"] - current_block["end"] - 1
+                        new_size = r["end"] - current_block["start"] + 1
+
+                        if reg_type == current_block["register_type"] and g <= gap and new_size <= 120:
+                            current_block["end"] = max(current_block["end"], r["end"])
+                            current_block["sensors"].append(r["sensor"])
+                        else:
+                            blocks.append(current_block)
+                            current_block = {
+                                "slave": slave_id,
+                                "register_type": reg_type,
+                                "start": r["start"],
+                                "end": r["end"],
+                                "sensors": [r["sensor"]]
+                            }
+                if current_block:
+                    blocks.append(current_block)
+
+                # Test deze groepering met verschillende delays
+                for delay in test_delays:
+                    successes = 0
+                    failures = 0
+                    total_time = 0.0
+
+                    # Doe 3 test runs per configuratie
+                    for iteration in range(3):
+                        start_run = time.time()
+                        run_success = True
+
+                        for block in blocks:
+                            res = self.read_block(block)
+                            if res is None:
+                                run_success = False
+                                break
+                            if len(blocks) > 1 and delay > 0:
+                                time.sleep(delay)
+
+                        duration = time.time() - start_run
+                        if run_success:
+                            successes += 1
+                            total_time += duration
+                        else:
+                            failures += 1
+
+                    success_rate = successes / 3.0
+                    avg_duration = (total_time / successes) if successes > 0 else float('inf')
+
+                    results.append({
+                        "max_gap": gap,
+                        "delay_between_requests": delay,
+                        "success_rate": success_rate,
+                        "avg_duration_sec": avg_duration,
+                        "blocks_count": len(blocks)
+                    })
+
+                    logger.info(f"Stress-test Slave {slave_id}: gap={gap}, delay={delay} -> Success={success_rate * 100}%, Tijd={avg_duration:.3f}s (Blokken: {len(blocks)})")
+
+                    # Bepaal of dit de beste stabiele instelling is
+                    if success_rate > best_success_rate:
+                        best_success_rate = success_rate
+                        best_duration = avg_duration
+                        best_cfg = {"max_gap": gap, "delay_between_requests": delay, "blocks_count": len(blocks)}
+                    elif success_rate == best_success_rate and success_rate > 0.0:
+                        # Als succes rate gelijk is, kies de snelste
+                        if avg_duration < best_duration:
+                            best_duration = avg_duration
+                            best_cfg = {"max_gap": gap, "delay_between_requests": delay, "blocks_count": len(blocks)}
+
+        if best_cfg:
+            logger.info(f"🏆 Optimale instelling voor Slave {slave_id}: max_gap={best_cfg['max_gap']}, delay={best_cfg['delay_between_requests']} (Succes: {best_success_rate * 100}%, Tijd: {best_duration:.3f}s)")
+            return {
+                "success": True,
+                "slave": slave_id,
+                "optimal_settings": best_cfg,
+                "best_success_rate": best_success_rate,
+                "best_duration_sec": best_duration,
+                "all_runs": results
+            }
+        else:
+            logger.error(f"❌ Geen enkele succesvolle poll-configuratie gevonden tijdens stress-test voor Slave {slave_id}!")
+            return {
+                "success": False,
+                "slave": slave_id,
+                "error": "Geen enkele configuratie werkte stabiel tijdens de stress-test. Controleer de bekabeling."
+            }
+
+    def apply_settings(self, slave_id, max_gap, delay):
+        """Sla de optimale instellingen op voor een specifieke slave in config.yaml."""
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            config_data = yaml.safe_load(content) or {}
+        except Exception as e:
+            raise ValueError(f"Kan huidige configuratie niet inlezen: {e}")
+
+        modbus_cfg = config_data.setdefault("modbus", {})
+        slave_max_gaps = modbus_cfg.setdefault("slave_max_gaps", {})
+        slave_delays = modbus_cfg.setdefault("slave_delays", {})
+
+        # Sla de parameters op
+        slave_max_gaps[str(slave_id)] = int(max_gap)
+        slave_delays[str(slave_id)] = float(delay)
+
+        # Dump terug naar YAML met behoud van opmaak (Unicode)
+        try:
+            new_yaml = yaml.dump(config_data, allow_unicode=True, sort_keys=False)
+            self.reload_configuration(new_yaml)
+            return {"success": True, "message": f"Instellingen succesvol toegepast en opgeslagen voor Slave {slave_id}!"}
+        except Exception as e:
+            raise ValueError(f"Fout bij opslaan van nieuwe instellingen: {e}")
+
     def reload_configuration(self, new_yaml_content):
         """Valideer de ingevoerde YAML, schrijf deze naar config.yaml en herlaad verbindingen."""
         try:
@@ -1296,6 +1481,52 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(json.dumps({"success": True, "message": "Configuratie succesvol bijgewerkt en herladen!"}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+        elif path.endswith("/api/optimize"):
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                params = json.loads(post_data)
+                slave = int(params.get("slave"))
+                
+                # Voer stress test uit
+                result = self.server.bridge.run_slave_benchmark(slave)
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+        elif path.endswith("/api/apply-settings"):
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                params = json.loads(post_data)
+                slave = int(params.get("slave"))
+                max_gap = int(params.get("max_gap"))
+                delay = float(params.get("delay"))
+                
+                # Sla de instellingen op
+                result = self.server.bridge.apply_settings(slave, max_gap, delay)
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
             except Exception as e:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
@@ -1661,6 +1892,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="nav-tabs">
             <button id="btn-tab-dashboard" class="tab-btn active" onclick="switchTab('dashboard')">📊 Status Dashboard</button>
             <button id="btn-tab-editor" class="tab-btn" onclick="switchTab('editor')">📝 Configuratie Editor</button>
+            <button id="btn-tab-optimizer" class="tab-btn" onclick="switchTab('optimizer')">⚙️ Optimalisatie</button>
         </div>
         
         <!-- Tab 1: Dashboard -->
@@ -1724,6 +1956,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </div>
             </div>
         </div>
+
+        <!-- Tab 3: Optimizer -->
+        <div id="tab-optimizer" class="tab-content">
+            <div class="editor-container">
+                <div class="section-title">⚙️ Modbus Slave Stress-test & Optimalisatie</div>
+                <p style="color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.95rem;">
+                    Hier kun je per aangesloten Modbus-apparaat (Slave ID) een intensieve stresstest uitvoeren. Het systeem test verschillende register-blokgroottes (`max_gap`) en wachttijden (`delay_between_requests`) om de snelste, 100% stabiele instelling te bepalen.
+                </p>
+                <div id="optimizer-list" class="grid" style="grid-template-columns: 1fr;">
+                    <div class="card">
+                        <div class="text-center">Gegevens laden...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
         
         <div class="footer">
             Modbus-MQTT Bridge Add-on v1.0.14 • Ontwikkeld voor Raspberry Pi & Home Assistant
@@ -1736,6 +1983,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const configURL = ingressPath + "/api/config";
         
         let activeTab = 'dashboard';
+        let optimizerSlavesRendered = false;
         
         function switchTab(tabId) {
             activeTab = tabId;
@@ -1750,6 +1998,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             if (tabId === 'editor') {
                 loadConfiguration();
+            } else if (tabId === 'optimizer') {
+                fetch(apiURL)
+                    .then(response => response.json())
+                    .then(data => {
+                        buildOptimizerTab(data.sensors);
+                    })
+                    .catch(err => console.error("Fout bij laden slaves voor optimizer:", err));
             }
         }
         
@@ -1797,6 +2052,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             .then(({ status, data }) => {
                 if (status === 200 && data.success) {
                     statusText.innerText = "Configuratie succesvol herladen!";
+                    optimizerSlavesRendered = false;
                     alertContainer.innerHTML = `
                         <div class="alert-box alert-box-success">
                             <strong>✅ Succes:</strong> ${data.message}
@@ -1822,6 +2078,264 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             });
         }
         
+        function getDeviceName(slaveId, sensors) {
+            if (slaveId === 1) return "Warmtepomp";
+            if (slaveId === 2) return "Sinotimer";
+            if (slaveId >= 3 && slaveId <= 5) return `KWS Verbruiksmeter (Slave ${slaveId})`;
+            if (slaveId >= 51 && slaveId <= 55) return `Growatt Zonnepaneel Inverter (Slave ${slaveId})`;
+            
+            const slaveSensors = sensors.filter(s => parseInt(s.slave) === slaveId);
+            if (slaveSensors.length > 0) {
+                const names = slaveSensors.map(s => s.name.split(' ')[0]);
+                if (names.length > 0) {
+                    return names[0] + ` (Slave ${slaveId})`;
+                }
+            }
+            return `Modbus Apparaat (Slave ${slaveId})`;
+        }
+
+        function buildOptimizerTab(sensors) {
+            if (optimizerSlavesRendered) return;
+            
+            const slavesMap = {};
+            sensors.forEach(s => {
+                const slave = parseInt(s.slave);
+                if (!slavesMap[slave]) {
+                    slavesMap[slave] = {
+                        id: slave,
+                        sensorCount: 0
+                    };
+                }
+                slavesMap[slave].sensorCount++;
+            });
+            
+            const container = document.getElementById('optimizer-list');
+            let html = '';
+            
+            const sortedSlaves = Object.keys(slavesMap).map(Number).sort((a, b) => a - b);
+            
+            if (sortedSlaves.length === 0) {
+                container.innerHTML = '<div class="card"><div class="text-center">Geen Modbus-slaves gevonden in de configuratie.</div></div>';
+                return;
+            }
+            
+            sortedSlaves.forEach(slaveId => {
+                const name = getDeviceName(slaveId, sensors);
+                const count = slavesMap[slaveId].sensorCount;
+                
+                html += `
+                    <div class="card" id="opt-card-${slaveId}" style="margin-bottom: 1.5rem;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+                            <div>
+                                <h3 style="font-size: 1.25rem; font-weight: 700; margin-bottom: 0.25rem;">${name}</h3>
+                                <p style="color: var(--text-muted); font-size: 0.85rem;">
+                                    Slave ID: <strong>${slaveId}</strong> • Geconfigureerde sensoren: <strong>${count}</strong>
+                                </p>
+                            </div>
+                            <div>
+                                <button class="btn btn-primary" id="btn-opt-${slaveId}" onclick="runStressTest(${slaveId})">
+                                    ⚡ Optimaliseer & Stress-test
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Voortgangsindicator -->
+                        <div id="opt-progress-container-${slaveId}" style="display: none; margin-top: 1.5rem; border-top: 1px solid var(--card-border); padding-top: 1rem;">
+                            <div style="display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 0.5rem;">
+                                <span id="opt-status-text-${slaveId}" style="color: var(--primary); font-weight: 600;">Bezig met stress-test...</span>
+                                <span id="opt-percent-text-${slaveId}">0%</span>
+                            </div>
+                            <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; border: 1px solid var(--card-border);">
+                                <div id="opt-progress-bar-${slaveId}" style="width: 0%; height: 100%; background: var(--primary); transition: width 0.2s;"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- Resultaten weergave -->
+                        <div id="opt-results-${slaveId}" style="display: none; margin-top: 1.5rem; border-top: 1px solid var(--card-border); padding-top: 1.25rem;">
+                            <!-- Resultaten details komen hier -->
+                        </div>
+                    </div>
+                `;
+            });
+            
+            container.innerHTML = html;
+            optimizerSlavesRendered = true;
+        }
+
+        function runStressTest(slaveId) {
+            const btn = document.getElementById(`btn-opt-${slaveId}`);
+            btn.disabled = true;
+            btn.innerText = "⏳ Bezig met testen...";
+            
+            const progressContainer = document.getElementById(`opt-progress-container-${slaveId}`);
+            const statusText = document.getElementById(`opt-status-text-${slaveId}`);
+            const percentText = document.getElementById(`opt-percent-text-${slaveId}`);
+            const progressBar = document.getElementById(`opt-progress-bar-${slaveId}`);
+            const resultsContainer = document.getElementById(`opt-results-${slaveId}`);
+            
+            progressContainer.style.display = "block";
+            resultsContainer.style.display = "none";
+            
+            progressBar.style.width = "0%";
+            percentText.innerText = "0%";
+            statusText.innerText = "Stress-test opstarten op Modbus-lus...";
+            
+            let percent = 0;
+            const progressInterval = setInterval(() => {
+                if (percent < 90) {
+                    percent += Math.floor(Math.random() * 5) + 2;
+                    if (percent > 90) percent = 90;
+                    progressBar.style.width = `${percent}%`;
+                    percentText.innerText = `${percent}%`;
+                    
+                    if (percent < 30) {
+                        statusText.innerText = "Register-blokgroottes testen (max_gap)...";
+                    } else if (percent < 60) {
+                        statusText.innerText = "Wachttijden scannen (delay_between_requests)...";
+                    } else {
+                        statusText.innerText = "Optimaliteit en foutmarges berekenen...";
+                    }
+                }
+            }, 300);
+            
+            const optimizeURL = ingressPath + "/api/optimize";
+            fetch(optimizeURL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ slave: slaveId })
+            })
+            .then(response => {
+                clearInterval(progressInterval);
+                if (!response.ok) throw new Error("Fout status code: " + response.status);
+                return response.json();
+            })
+            .then(result => {
+                progressBar.style.width = "100%";
+                percentText.innerText = "100%";
+                statusText.innerText = "Optimalisatie voltooid!";
+                
+                btn.disabled = false;
+                btn.innerText = "⚡ Optimaliseer & Stress-test";
+                
+                if (result.success) {
+                    displayOptimizationResults(slaveId, result);
+                } else {
+                    resultsContainer.innerHTML = `
+                        <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
+                            <strong>❌ Stress-test mislukt:</strong><br>${result.error || 'Onbekende fout'}
+                        </div>
+                    `;
+                    resultsContainer.style.display = "block";
+                }
+            })
+            .catch(err => {
+                clearInterval(progressInterval);
+                btn.disabled = false;
+                btn.innerText = "⚡ Optimaliseer & Stress-test";
+                
+                progressBar.style.width = "100%";
+                progressBar.style.backgroundColor = "var(--danger)";
+                statusText.innerText = "Fout opgetreden.";
+                statusText.style.color = "var(--danger)";
+                
+                resultsContainer.innerHTML = `
+                    <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
+                        <strong>❌ Netwerk- of gatewayfout:</strong><br>${err.message || err}
+                    </div>
+                `;
+                resultsContainer.style.display = "block";
+            });
+        }
+
+        function displayOptimizationResults(slaveId, result) {
+            const resultsContainer = document.getElementById(`opt-results-${slaveId}`);
+            resultsContainer.style.display = "block";
+            
+            const opt = result.optimal_settings;
+            const rate = result.best_success_rate * 100;
+            const duration = result.best_duration_sec.toFixed(3);
+            
+            let successColor = "var(--success)";
+            if (rate < 100 && rate >= 80) successColor = "var(--warning)";
+            if (rate < 80) successColor = "var(--danger)";
+            
+            resultsContainer.innerHTML = `
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.25rem;">
+                    <div class="card" style="background: rgba(255,255,255,0.01); border-color: rgba(255,255,255,0.03); padding: 0.75rem 1rem;">
+                        <div style="font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase;">Geadviseerde Gap</div>
+                        <div style="font-size: 1.5rem; font-weight: 800; color: var(--primary);">max_gap: ${opt.max_gap}</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">registers maximale kloof</div>
+                    </div>
+                    <div class="card" style="background: rgba(255,255,255,0.01); border-color: rgba(255,255,255,0.03); padding: 0.75rem 1rem;">
+                        <div style="font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase;">Geadviseerde Pauze</div>
+                        <div style="font-size: 1.5rem; font-weight: 800; color: var(--primary);">${opt.delay_between_requests} s</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">delay_between_requests</div>
+                    </div>
+                    <div class="card" style="background: rgba(255,255,255,0.01); border-color: rgba(255,255,255,0.03); padding: 0.75rem 1rem;">
+                        <div style="font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase;">Betrouwbaarheid</div>
+                        <div style="font-size: 1.5rem; font-weight: 800; color: ${successColor};">${rate.toFixed(1)}%</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">Succesvolle test-polls</div>
+                    </div>
+                    <div class="card" style="background: rgba(255,255,255,0.01); border-color: rgba(255,255,255,0.03); padding: 0.75rem 1rem;">
+                        <div style="font-size: 0.8rem; color: var(--text-muted); text-transform: uppercase;">Poll Cyclusduur</div>
+                        <div style="font-size: 1.5rem; font-weight: 800; color: #fff;">${duration} s</div>
+                        <div style="font-size: 0.75rem; color: var(--text-muted);">Groepeert in ${opt.blocks_count} Modbus-blokken</div>
+                    </div>
+                </div>
+                
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem; background: rgba(59, 130, 246, 0.05); border: 1px dashed rgba(59, 130, 246, 0.2); padding: 1rem; border-radius: 12px;">
+                    <div style="font-size: 0.9rem;">
+                        <strong>💡 Advies:</strong> Sla deze parameters op om de communicatiesnelheid voor Slave ${slaveId} te optimaliseren.
+                    </div>
+                    <button class="btn btn-primary" id="btn-apply-${slaveId}" onclick="applyOptimizerSettings(${slaveId}, ${opt.max_gap}, ${opt.delay_between_requests})" style="background-color: var(--success); font-size: 0.9rem; padding: 0.5rem 1.25rem;">
+                        ✅ Toepassen & Opslaan
+                    </button>
+                </div>
+            `;
+        }
+
+        function applyOptimizerSettings(slaveId, maxGap, delay) {
+            const btn = document.getElementById(`btn-apply-${slaveId}`);
+            btn.disabled = true;
+            btn.innerText = "⏳ Bezig met opslaan...";
+            
+            const applyURL = ingressPath + "/api/apply-settings";
+            fetch(applyURL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    slave: slaveId,
+                    max_gap: maxGap,
+                    delay: delay
+                })
+            })
+            .then(response => {
+                if (!response.ok) throw new Error("Fout status code: " + response.status);
+                return response.json();
+            })
+            .then(result => {
+                if (result.success) {
+                    btn.innerText = "Opgeslagen!";
+                    btn.style.backgroundColor = "var(--primary)";
+                    alert("Optimalisatie-instellingen succesvol toegepast! De bridge is opnieuw opgestart met de nieuwe parameters.");
+                    optimizerSlavesRendered = false;
+                } else {
+                    alert("Fout bij opslaan: " + result.error);
+                    btn.disabled = false;
+                    btn.innerText = "✅ Toepassen & Opslaan";
+                }
+            })
+            .catch(err => {
+                alert("Netwerkfout bij opslaan: " + err.message);
+                btn.disabled = false;
+                btn.innerText = "✅ Toepassen & Opslaan";
+            });
+        }
+
         function updateDashboard() {
             if (activeTab !== 'dashboard') return;
             
