@@ -2465,6 +2465,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const apiURL = ingressPath + "/api/status";
         const configURL = ingressPath + "/api/config";
         
+        // Wrapper die altijd session-cookies meestuurt (nodig voor HA Ingress authenticatie)
+        function apiFetch(url, options = {}) {
+            return fetch(url, { credentials: 'include', ...options });
+        }
+        
         let activeTab = 'dashboard';
         let optimizerSlavesRendered = false;
         
@@ -2482,7 +2487,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (tabId === 'editor') {
                 loadConfiguration();
             } else if (tabId === 'optimizer') {
-                fetch(apiURL)
+                apiFetch(apiURL)
                     .then(response => response.json())
                     .then(data => {
                         buildOptimizerTab(data.sensors);
@@ -2495,7 +2500,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const statusText = document.getElementById('editor-status-text');
             statusText.innerText = "Bezig met inladen van bestand...";
             
-            fetch(configURL)
+            apiFetch(configURL)
                 .then(response => {
                     if (!response.ok) throw new Error("Fout status code: " + response.status);
                     return response.text();
@@ -2524,7 +2529,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             statusText.innerText = "Opslaan en valideren...";
             alertContainer.innerHTML = '';
             
-            fetch(configURL, {
+            apiFetch(configURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'text/plain'
@@ -2649,7 +2654,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         function pollTaskStatus(taskId, type, idOrSlaveId, lastLogIdx) {
             const statusURL = `${ingressPath}/api/task-status?task_id=${taskId}&last_log_index=${lastLogIdx}`;
             
-            fetch(statusURL)
+            apiFetch(statusURL)
             .then(response => {
                 if (!response.ok) throw new Error("Fout bij ophalen status: " + response.status);
                 return response.json();
@@ -2793,7 +2798,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             statusText.innerText = "Stress-test opstarten op Modbus-lus...";
             
             const optimizeURL = ingressPath + "/api/optimize";
-            fetch(optimizeURL, {
+            apiFetch(optimizeURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -2889,7 +2894,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             btn.innerText = "⏳ Bezig met opslaan...";
             
             const applyURL = ingressPath + "/api/apply-settings";
-            fetch(applyURL, {
+            apiFetch(applyURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -2967,7 +2972,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             statusText.innerText = "Modbus verbinding controleren...";
             
             const scanURL = ingressPath + "/api/scan-registers";
-            fetch(scanURL, {
+            apiFetch(scanURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -3233,7 +3238,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             btn.innerText = "⏳ Bezig met toevoegen...";
             
             const addURL = ingressPath + "/api/add-sensors";
-            fetch(addURL, {
+            fetch(addURL, { credentials: 'include',
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -3269,7 +3274,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const controller = new AbortController();
             const timeoutId = setTimeout(() => controller.abort(), 8000);
             
-            fetch(apiURL, { signal: controller.signal })
+            apiFetch(apiURL, { signal: controller.signal })
                 .then(response => {
                     clearTimeout(timeoutId);
                     return response.json();
