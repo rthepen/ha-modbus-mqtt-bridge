@@ -24,7 +24,6 @@ except ImportError:
 from pymodbus.client import ModbusTcpClient
 from pymodbus.framer import FramerType
 import paho.mqtt.client as mqtt
-from urllib.parse import urlparse, parse_qs
 
 # ==============================================================================
 # Logging Configuratie
@@ -88,8 +87,6 @@ class ModbusMqttBridge:
         self.mqtt_buffer = {}  # topic -> (payload, retain)
         self.buffer_lock = threading.Lock()
         self.modbus_lock = threading.RLock()
-        self.active_tasks = {}
-        self.tasks_lock = threading.Lock()
 
         if self.debug:
             logger.setLevel(logging.DEBUG)
@@ -107,48 +104,6 @@ class ModbusMqttBridge:
         
         # Start de status HTTP Ingress server
         self.start_http_server()
-
-    def register_task(self, task_id, initial_percent=0):
-        with self.tasks_lock:
-            self.active_tasks[task_id] = {
-                "status": "running",
-                "percent": initial_percent,
-                "logs": [],
-                "result": None,
-                "error": None
-            }
-
-    def update_task(self, task_id, percent=None, log_msg=None, status=None, result=None, error=None):
-        with self.tasks_lock:
-            if task_id not in self.active_tasks:
-                return
-            task = self.active_tasks[task_id]
-            if percent is not None:
-                task["percent"] = percent
-            if log_msg is not None:
-                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-                task["logs"].append(f"[{timestamp}] {log_msg}")
-            if status is not None:
-                task["status"] = status
-            if result is not None:
-                task["result"] = result
-            if error is not None:
-                task["error"] = error
-
-    def get_task_status(self, task_id, last_log_idx):
-        with self.tasks_lock:
-            if task_id not in self.active_tasks:
-                return {"success": False, "error": "Taak niet gevonden."}
-            task = self.active_tasks[task_id]
-            logs = task["logs"][last_log_idx:]
-            return {
-                "success": True,
-                "status": task["status"],
-                "percent": task["percent"],
-                "new_logs": logs,
-                "result": task["result"] if task["status"] == "completed" else None,
-                "error": task["error"]
-            }
 
     def get_device_info_by_slave(self, slave):
         """Bepaal apparaatnaam en identifiers op basis van slave ID."""
@@ -1228,34 +1183,16 @@ class ModbusMqttBridge:
 
     def get_status_html(self, ingress_path=""):
         """Genereer de HTML-pagina voor het status dashboard."""
-        # Lees versie dynamisch uit de addon config.yaml
-        version = "?"
-        try:
-            import re
-            addon_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
-            if os.path.exists(addon_cfg):
-                with open(addon_cfg, 'r') as f:
-                    m = re.search(r'^version:\s*["\']?([\d.]+)["\']?', f.read(), re.MULTILINE)
-                    if m:
-                        version = m.group(1)
-        except Exception:
-            pass
-        return HTML_TEMPLATE.replace("{{INGRESS_PATH}}", ingress_path).replace("{{VERSION}}", version)
+        return HTML_TEMPLATE.replace("{{INGRESS_PATH}}", ingress_path)
 
-    def run_slave_benchmark(self, slave_id, task_id=None):
+    def run_slave_benchmark(self, slave_id):
         """Voert een uitgebreide stress-test uit op een specifieke slave om de optimale grouping en delay te bepalen."""
         sensors = self.config.get("sensors", [])
         slave_sensors = [s for s in sensors if int(s.get("slave", 1)) == slave_id]
         if not slave_sensors:
-            err = f"Geen sensoren geconfigureerd voor Slave {slave_id}."
-            if task_id:
-                self.update_task(task_id, status="failed", error=err)
-            return {"success": False, "error": err}
+            return {"success": False, "error": f"Geen sensoren geconfigureerd voor Slave {slave_id}."}
 
-        msg_start = f"🏁 Starten van Modbus stress-test en optimalisatie voor Slave {slave_id} (Sensoren: {len(slave_sensors)})..."
-        logger.info(msg_start)
-        if task_id:
-            self.update_task(task_id, percent=5, log_msg=msg_start)
+        logger.info(f"🏁 Starten van Modbus stress-test en optimalisatie voor Slave {slave_id} (Sensoren: {len(slave_sensors)})...")
 
         # Test combinaties van max_gap en delay
         test_gaps = [1, 2, 5, 10, 15, 20]
@@ -1279,9 +1216,6 @@ class ModbusMqttBridge:
                     "count": count
                 })
             sensor_ranges.sort(key=lambda x: x["start"])
-
-            total_combos = len(test_gaps) * len(test_delays)
-            combo_idx = 0
 
             for gap in test_gaps:
                 # Groepeer sensoren specifiek voor deze max_gap test
@@ -1318,14 +1252,6 @@ class ModbusMqttBridge:
 
                 # Test deze groepering met verschillende delays
                 for delay in test_delays:
-                    percent = 5 + int(85 * (combo_idx / total_combos))
-                    combo_idx += 1
-                    
-                    msg_test = f"Combinatie {combo_idx}/{total_combos} testen: gap={gap}, delay={delay:.2f}s (Aantal blokken: {len(blocks)})..."
-                    logger.info(msg_test)
-                    if task_id:
-                        self.update_task(task_id, percent=percent, log_msg=msg_test)
-
                     successes = 0
                     failures = 0
                     total_time = 0.0
@@ -1361,10 +1287,7 @@ class ModbusMqttBridge:
                         "blocks_count": len(blocks)
                     })
 
-                    msg_res = f"  -> Resultaat: Success={success_rate * 100}%, Tijd={avg_duration:.3f}s"
-                    logger.info(msg_res)
-                    if task_id:
-                        self.update_task(task_id, log_msg=msg_res)
+                    logger.info(f"Stress-test Slave {slave_id}: gap={gap}, delay={delay} -> Success={success_rate * 100}%, Tijd={avg_duration:.3f}s (Blokken: {len(blocks)})")
 
                     # Bepaal of dit de beste stabiele instelling is
                     if success_rate > best_success_rate:
@@ -1378,9 +1301,8 @@ class ModbusMqttBridge:
                             best_cfg = {"max_gap": gap, "delay_between_requests": delay, "blocks_count": len(blocks)}
 
         if best_cfg:
-            msg_best = f"🏆 Optimale instelling voor Slave {slave_id}: max_gap={best_cfg['max_gap']}, delay={best_cfg['delay_between_requests']} (Succes: {best_success_rate * 100}%, Tijd: {best_duration:.3f}s)"
-            logger.info(msg_best)
-            ret = {
+            logger.info(f"🏆 Optimale instelling voor Slave {slave_id}: max_gap={best_cfg['max_gap']}, delay={best_cfg['delay_between_requests']} (Succes: {best_success_rate * 100}%, Tijd: {best_duration:.3f}s)")
+            return {
                 "success": True,
                 "slave": slave_id,
                 "optimal_settings": best_cfg,
@@ -1388,20 +1310,13 @@ class ModbusMqttBridge:
                 "best_duration_sec": best_duration,
                 "all_runs": results
             }
-            if task_id:
-                self.update_task(task_id, percent=100, log_msg=msg_best, status="completed", result=ret)
-            return ret
         else:
-            err_fail = f"❌ Geen enkele succesvolle poll-configuratie gevonden tijdens stress-test voor Slave {slave_id}!"
-            logger.error(err_fail)
-            ret = {
+            logger.error(f"❌ Geen enkele succesvolle poll-configuratie gevonden tijdens stress-test voor Slave {slave_id}!")
+            return {
                 "success": False,
                 "slave": slave_id,
                 "error": "Geen enkele configuratie werkte stabiel tijdens de stress-test. Controleer de bekabeling."
             }
-            if task_id:
-                self.update_task(task_id, percent=100, log_msg=err_fail, status="failed", error=ret["error"])
-            return ret
 
     def apply_settings(self, slave_id, max_gap, delay):
         """Sla de optimale instellingen op voor een specifieke slave in config.yaml."""
@@ -1428,14 +1343,11 @@ class ModbusMqttBridge:
         except Exception as e:
             raise ValueError(f"Fout bij opslaan van nieuwe instellingen: {e}")
 
-    def scan_range(self, slave, reg_type, start_addr, quantity, task_id=None, pct_range=None):
+    def scan_range(self, slave, reg_type, start_addr, quantity):
         """Scant een specifieke reeks registers in blokken en valt terug op individueel."""
         results = []
         block_size = 20
-        steps = list(range(start_addr, start_addr + quantity, block_size))
-        total_steps = len(steps)
-        
-        for idx, block_start in enumerate(steps):
+        for block_start in range(start_addr, start_addr + quantity, block_size):
             block_count = min(block_size, start_addr + quantity - block_start)
             block = {
                 "slave": slave,
@@ -1444,22 +1356,8 @@ class ModbusMqttBridge:
                 "end": block_start + block_count - 1
             }
             
-            if task_id and pct_range:
-                start_pct, end_pct = pct_range
-                curr_pct = int(start_pct + (end_pct - start_pct) * (idx / total_steps))
-                self.update_task(task_id, percent=curr_pct)
-            
-            msg = f"Scan block {block_start} t/m {block_start + block_count - 1} op type '{reg_type}'..."
-            if task_id:
-                self.update_task(task_id, log_msg=msg)
-            logger.info(msg)
-            
             regs = self.read_block(block)
             if regs is not None:
-                msg_ok = f"  -> Gevonden: {len(regs)} registers"
-                if task_id:
-                    self.update_task(task_id, log_msg=msg_ok)
-                logger.info(msg_ok)
                 for i in range(len(regs)):
                     results.append({
                         "address": block_start + i,
@@ -1467,10 +1365,6 @@ class ModbusMqttBridge:
                         "value_16": regs[i]
                     })
             else:
-                msg_fail = f"  -> Mislukt, proberen per register..."
-                if task_id:
-                    self.update_task(task_id, log_msg=msg_fail)
-                logger.warning(msg_fail)
                 for addr in range(block_start, block_start + block_count):
                     single_block = {
                         "slave": slave,
@@ -1480,9 +1374,6 @@ class ModbusMqttBridge:
                     }
                     val = self.read_block(single_block)
                     if val is not None and len(val) > 0:
-                        msg_sing = f"    Register {addr}: {val[0]}"
-                        if task_id:
-                            self.update_task(task_id, log_msg=msg_sing)
                         results.append({
                             "address": addr,
                             "register_type": reg_type,
@@ -1491,21 +1382,16 @@ class ModbusMqttBridge:
                     time.sleep(0.01)
         return results
 
-    def scan_registers(self, slave_id, register_type, start_addr, quantity, task_id=None):
+    def scan_registers(self, slave_id, register_type, start_addr, quantity):
         """Scant holding en/of input registers op een slave met de modbus lock."""
         slave_id = int(slave_id)
         start_addr = int(start_addr)
         quantity = int(quantity)
         
         if quantity <= 0 or quantity > 1000:
-            if task_id:
-                self.update_task(task_id, status="failed", error="Aantal te scannen registers moet tussen 1 en 1000 liggen.")
             return {"success": False, "error": "Aantal te scannen registers moet tussen 1 en 1000 liggen."}
             
-        msg = f"🏁 Starten Modbus register scan op Slave {slave_id} (Type: {register_type}, Bereik: {start_addr}-{start_addr+quantity-1})..."
-        logger.info(msg)
-        if task_id:
-            self.update_task(task_id, percent=5, log_msg=msg)
+        logger.info(f"🏁 Starten Modbus register scan op Slave {slave_id} (Type: {register_type}, Bereik: {start_addr}-{start_addr+quantity-1})...")
         
         raw_results = []
         types_to_scan = []
@@ -1515,23 +1401,16 @@ class ModbusMqttBridge:
             types_to_scan.append("input")
             
         with self.modbus_lock:
-            for type_idx, reg_type in enumerate(types_to_scan):
+            for reg_type in types_to_scan:
                 try:
-                    pct_range = (5 + type_idx * 40, 5 + (type_idx + 1) * 40)
-                    type_results = self.scan_range(slave_id, reg_type, start_addr, quantity, task_id, pct_range)
+                    type_results = self.scan_range(slave_id, reg_type, start_addr, quantity)
                     raw_results.extend(type_results)
                 except Exception as e:
-                    err_msg = f"Fout tijdens scan op {reg_type} registers: {e}"
-                    logger.error(err_msg)
-                    if task_id:
-                        self.update_task(task_id, log_msg=f"❌ {err_msg}")
+                    logger.error(f"Fout tijdens scan op {reg_type} registers: {e}")
                     
         # Bouw een dictionary van (reg_type, adres) -> 16-bit waarde voor snelle lookup
         vals_map = {(r["register_type"], r["address"]): r["value_16"] for r in raw_results}
         
-        if task_id:
-            self.update_task(task_id, percent=90, log_msg="Gelezen data structureren...")
-            
         results = []
         for r in raw_results:
             addr = r["address"]
@@ -1559,16 +1438,12 @@ class ModbusMqttBridge:
                 
             results.append(item)
             
-        msg_fin = f"🔍 Scan voltooid op Slave {slave_id}. {len(results)} actieve registers gevonden."
-        logger.info(msg_fin)
-        ret = {
+        logger.info(f"🔍 Scan voltooid op Slave {slave_id}. {len(results)} actieve registers gevonden.")
+        return {
             "success": True,
             "slave": slave_id,
             "results": results
         }
-        if task_id:
-            self.update_task(task_id, percent=100, log_msg=msg_fin, status="completed", result=ret)
-        return ret
 
     def add_sensors(self, new_sensors):
         """Voegt een lijst met gescande sensoren toe aan config.yaml en herlaadt."""
@@ -1711,8 +1586,8 @@ class StatusHTTPServer(ThreadingHTTPServer):
 
 class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Log HTTP-verzoeken op INFO niveau voor debug doeleinden
-        logger.info(f"[HTTP] {format % args}")
+        # Override om de stdout logs schoon te houden
+        logger.debug(f"HTTP Server: {format % args}")
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -1722,15 +1597,7 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        parsed_url = urlparse(self.path)
-        path = parsed_url.path
-        query = parse_qs(parsed_url.query)
-        
-        # Log binnenkomende headers voor diagnose
-        ingress_path = self.headers.get("X-Ingress-Path", "")
-        ingress_path_raw = self.headers.get("X-Ingress-Path", "NIET_AANWEZIG")
-        logger.info(f"[HTTP-DEBUG] GET {path} | X-Ingress-Path={ingress_path_raw!r} | Host={self.headers.get('Host','?')!r}")
-        
+        path = self.path
         if path.endswith("/api/status"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -1749,21 +1616,9 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 config_content = f"# Fout bij lezen van bestand: {e}"
             self.wfile.write(config_content.encode('utf-8'))
-        elif path.endswith("/api/task-status"):
-            task_id = query.get("task_id", [None])[0]
-            last_log_idx = int(query.get("last_log_index", [0])[0])
-            
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            status_data = self.server.bridge.get_task_status(task_id, last_log_idx)
-            self.wfile.write(json.dumps(status_data).encode('utf-8'))
         else:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
             self.end_headers()
             
             ingress_path = self.headers.get("X-Ingress-Path", "")
@@ -1785,7 +1640,7 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": True, "message": "Configurature succesvol bijgewerkt en herladen!"}).encode('utf-8'))
+                self.wfile.write(json.dumps({"success": True, "message": "Configuratie succesvol bijgewerkt en herladen!"}).encode('utf-8'))
             except Exception as e:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
@@ -1800,21 +1655,14 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 params = json.loads(post_data)
                 slave = int(params.get("slave"))
                 
-                task_id = f"optimize_slave_{slave}_{int(time.time() * 1000)}"
-                self.server.bridge.register_task(task_id)
-                
-                t = threading.Thread(
-                    target=self.server.bridge.run_slave_benchmark,
-                    args=(slave, task_id),
-                    daemon=True
-                )
-                t.start()
+                # Voer stress test uit
+                result = self.server.bridge.run_slave_benchmark(slave)
                 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": True, "task_id": task_id}).encode('utf-8'))
+                self.wfile.write(json.dumps(result).encode('utf-8'))
             except Exception as e:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
@@ -1831,6 +1679,7 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 max_gap = int(params.get("max_gap"))
                 delay = float(params.get("delay"))
                 
+                # Sla de instellingen op
                 result = self.server.bridge.apply_settings(slave, max_gap, delay)
                 
                 self.send_response(200)
@@ -1855,21 +1704,14 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 start_addr = int(params.get("start_address", 0))
                 quantity = int(params.get("quantity", 100))
                 
-                task_id = f"scan_slave_{slave}_{int(time.time() * 1000)}"
-                self.server.bridge.register_task(task_id)
-                
-                t = threading.Thread(
-                    target=self.server.bridge.scan_registers,
-                    args=(slave, reg_type, start_addr, quantity, task_id),
-                    daemon=True
-                )
-                t.start()
+                # Voer scan uit
+                result = self.server.bridge.scan_registers(slave, reg_type, start_addr, quantity)
                 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
-                self.wfile.write(json.dumps({"success": True, "task_id": task_id}).encode('utf-8'))
+                self.wfile.write(json.dumps(result).encode('utf-8'))
             except Exception as e:
                 self.send_response(400)
                 self.send_header("Content-Type", "application/json")
@@ -1887,6 +1729,7 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 if not isinstance(new_sensors, list) or not new_sensors:
                     raise ValueError("Ongeldige of lege lijst met sensoren.")
                 
+                # Sla de sensoren op
                 result = self.server.bridge.add_sensors(new_sensors)
                 
                 self.send_response(200)
@@ -2242,23 +2085,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             font-size: 0.85rem;
             color: var(--text-muted);
         }
-        
-        .log-console {
-            background-color: rgba(0, 0, 0, 0.4);
-            border: 1px solid var(--card-border);
-            border-radius: 8px;
-            padding: 0.75rem;
-            margin-top: 1rem;
-            max-height: 200px;
-            overflow-y: auto;
-            font-family: 'Courier New', Courier, monospace;
-            font-size: 0.85rem;
-            color: #10b981;
-            white-space: pre-wrap;
-            word-break: break-all;
-            text-align: left;
-            display: none;
-        }
     </style>
 </head>
 <body>
@@ -2397,10 +2223,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <span id="scan-status-text" style="color: var(--primary); font-weight: 600;">Bezig met scannen...</span>
                             <span id="scan-percent-text">0%</span>
                         </div>
-                        <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; border: 1px solid var(--card-border); margin-bottom: 1rem;">
+                        <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; border: 1px solid var(--card-border);">
                             <div id="scan-progress-bar" style="width: 0%; height: 100%; background: var(--primary); transition: width 0.2s;"></div>
                         </div>
-                        <div id="scan-log-console" class="log-console"></div>
                     </div>
                 </div>
 
@@ -2440,35 +2265,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         
         <div class="footer">
-            Modbus-MQTT Bridge Add-on v{{VERSION}} • Ontwikkeld voor Raspberry Pi &amp; Home Assistant
+            Modbus-MQTT Bridge Add-on v1.0.14 • Ontwikkeld voor Raspberry Pi & Home Assistant
         </div>
     </div>
 
     <script>
-        // Bereken de basis-URL vanuit de huidig geladen pagina-URL
-        // HA Ingress serveert de pagina op /api/hassio_ingress/TOKEN/
-        // Relatieve URLs t.o.v. de paginabasis werken automatisch correct
-        function getApiBase() {
-            // Haal de URL op waarvandaan de pagina geladen is
-            const pageUrl = window.location.href;
-            // Verwijder alles na de laatste / om de basis te krijgen
-            const base = pageUrl.replace(/\/[^\/]*(\?.*)?$/, '/');
-            // Controleer of dit een HA ingress URL is
-            if (base.includes('/api/hassio_ingress/')) {
-                return base.replace(/\/$/, '');  // zonder trailing slash
-            }
-            // Fallback: gebruik server-side injectie
-            return "{{INGRESS_PATH}}";
-        }
-        
-        const ingressPath = getApiBase();
+        const ingressPath = "{{INGRESS_PATH}}";
         const apiURL = ingressPath + "/api/status";
         const configURL = ingressPath + "/api/config";
-        
-        // Wrapper die altijd session-cookies meestuurt (nodig voor HA Ingress authenticatie)
-        function apiFetch(url, options = {}) {
-            return fetch(url, { credentials: 'include', ...options });
-        }
         
         let activeTab = 'dashboard';
         let optimizerSlavesRendered = false;
@@ -2487,7 +2291,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (tabId === 'editor') {
                 loadConfiguration();
             } else if (tabId === 'optimizer') {
-                apiFetch(apiURL)
+                fetch(apiURL)
                     .then(response => response.json())
                     .then(data => {
                         buildOptimizerTab(data.sensors);
@@ -2500,7 +2304,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const statusText = document.getElementById('editor-status-text');
             statusText.innerText = "Bezig met inladen van bestand...";
             
-            apiFetch(configURL)
+            fetch(configURL)
                 .then(response => {
                     if (!response.ok) throw new Error("Fout status code: " + response.status);
                     return response.text();
@@ -2529,7 +2333,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             statusText.innerText = "Opslaan en valideren...";
             alertContainer.innerHTML = '';
             
-            apiFetch(configURL, {
+            fetch(configURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'text/plain'
@@ -2633,10 +2437,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                                 <span id="opt-status-text-${slaveId}" style="color: var(--primary); font-weight: 600;">Bezig met stress-test...</span>
                                 <span id="opt-percent-text-${slaveId}">0%</span>
                             </div>
-                            <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; border: 1px solid var(--card-border); margin-bottom: 1rem;">
+                            <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; border: 1px solid var(--card-border);">
                                 <div id="opt-progress-bar-${slaveId}" style="width: 0%; height: 100%; background: var(--primary); transition: width 0.2s;"></div>
                             </div>
-                            <div id="opt-log-console-${slaveId}" class="log-console"></div>
                         </div>
                         
                         <!-- Resultaten weergave -->
@@ -2651,131 +2454,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             optimizerSlavesRendered = true;
         }
 
-        function pollTaskStatus(taskId, type, idOrSlaveId, lastLogIdx) {
-            const statusURL = `${ingressPath}/api/task-status?task_id=${taskId}&last_log_index=${lastLogIdx}`;
-            
-            apiFetch(statusURL)
-            .then(response => {
-                if (!response.ok) throw new Error("Fout bij ophalen status: " + response.status);
-                return response.json();
-            })
-            .then(result => {
-                if (!result.success) {
-                    throw new Error(result.error || "Onbekende fout");
-                }
-                
-                let logConsole;
-                if (type === 'scanner') {
-                    logConsole = document.getElementById('scan-log-console');
-                } else {
-                    logConsole = document.getElementById(`opt-log-console-${idOrSlaveId}`);
-                }
-                
-                if (result.new_logs && result.new_logs.length > 0) {
-                    result.new_logs.forEach(line => {
-                        logConsole.innerHTML += line + "\n";
-                    });
-                    logConsole.scrollTop = logConsole.scrollHeight;
-                }
-                
-                const nextLogIdx = lastLogIdx + (result.new_logs ? result.new_logs.length : 0);
-                
-                let progressBar, percentText, statusText;
-                if (type === 'scanner') {
-                    progressBar = document.getElementById('scan-progress-bar');
-                    percentText = document.getElementById('scan-percent-text');
-                    statusText = document.getElementById('scan-status-text');
-                } else {
-                    progressBar = document.getElementById(`opt-progress-bar-${idOrSlaveId}`);
-                    percentText = document.getElementById(`opt-percent-text-${idOrSlaveId}`);
-                    statusText = document.getElementById(`opt-status-text-${idOrSlaveId}`);
-                }
-                
-                progressBar.style.width = `${result.percent}%`;
-                percentText.innerText = `${result.percent}%`;
-                
-                if (type === 'scanner') {
-                    statusText.innerText = `Registers scannen (${result.percent}%)...`;
-                } else {
-                    if (result.percent < 30) {
-                        statusText.innerText = "Register-blokgroottes testen (max_gap)...";
-                    } else if (result.percent < 60) {
-                        statusText.innerText = "Wachttijden scannen (delay_between_requests)...";
-                    } else {
-                        statusText.innerText = "Optimaliteit en foutmarges berekenen...";
-                    }
-                }
-                
-                if (result.status === 'completed') {
-                    progressBar.style.width = "100%";
-                    percentText.innerText = "100%";
-                    
-                    if (type === 'scanner') {
-                        statusText.innerText = "Scan voltooid!";
-                        const btn = document.getElementById('btn-start-scan');
-                        btn.disabled = false;
-                        btn.innerText = "⚡ Start Scan";
-                        
-                        const resultsContainer = document.getElementById('scan-results-container');
-                        currentScanResults = result.result.results;
-                        displayScanResults(result.result.results);
-                    } else {
-                        statusText.innerText = "Optimalisatie voltooid!";
-                        const btn = document.getElementById(`btn-opt-${idOrSlaveId}`);
-                        btn.disabled = false;
-                        btn.innerText = "⚡ Optimaliseer & Stress-test";
-                        
-                        displayOptimizationResults(idOrSlaveId, result.result);
-                    }
-                } else if (result.status === 'failed') {
-                    progressBar.style.width = "100%";
-                    progressBar.style.backgroundColor = "var(--danger)";
-                    statusText.innerText = "Mislukt.";
-                    statusText.style.color = "var(--danger)";
-                    
-                    if (type === 'scanner') {
-                        const btn = document.getElementById('btn-start-scan');
-                        btn.disabled = false;
-                        btn.innerText = "⚡ Start Scan";
-                        
-                        const resultsContainer = document.getElementById('scan-results-container');
-                        const alertContainer = document.getElementById('scan-alert-container');
-                        resultsContainer.style.display = "block";
-                        alertContainer.innerHTML = `
-                            <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
-                                <strong>❌ Scan mislukt:</strong><br>${result.error || 'Onbekende fout'}
-                            </div>
-                        `;
-                        document.getElementById('scan-table-body').innerHTML = '<tr><td colspan="4" class="text-center">Scan mislukt.</td></tr>';
-                        document.getElementById('scan-select-all').checked = false;
-                        document.getElementById('scan-configs-container').style.display = "none";
-                    } else {
-                        const btn = document.getElementById(`btn-opt-${idOrSlaveId}`);
-                        btn.disabled = false;
-                        btn.innerText = "⚡ Optimaliseer & Stress-test";
-                        
-                        const resultsContainer = document.getElementById(`opt-results-${idOrSlaveId}`);
-                        resultsContainer.innerHTML = `
-                            <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
-                                <strong>❌ Stress-test mislukt:</strong><br>${result.error || 'Onbekende fout'}
-                            </div>
-                        `;
-                        resultsContainer.style.display = "block";
-                    }
-                } else {
-                    setTimeout(() => {
-                        pollTaskStatus(taskId, type, idOrSlaveId, nextLogIdx);
-                    }, 500);
-                }
-            })
-            .catch(err => {
-                console.error("Task status polling error: ", err);
-                setTimeout(() => {
-                    pollTaskStatus(taskId, type, idOrSlaveId, lastLogIdx);
-                }, 1000);
-            });
-        }
-
         function runStressTest(slaveId) {
             const btn = document.getElementById(`btn-opt-${slaveId}`);
             btn.disabled = true;
@@ -2786,19 +2464,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const percentText = document.getElementById(`opt-percent-text-${slaveId}`);
             const progressBar = document.getElementById(`opt-progress-bar-${slaveId}`);
             const resultsContainer = document.getElementById(`opt-results-${slaveId}`);
-            const logConsole = document.getElementById(`opt-log-console-${slaveId}`);
             
             progressContainer.style.display = "block";
             resultsContainer.style.display = "none";
-            logConsole.style.display = "block";
-            logConsole.innerHTML = "";
             
             progressBar.style.width = "0%";
             percentText.innerText = "0%";
             statusText.innerText = "Stress-test opstarten op Modbus-lus...";
             
+            let percent = 0;
+            const progressInterval = setInterval(() => {
+                if (percent < 90) {
+                    percent += Math.floor(Math.random() * 5) + 2;
+                    if (percent > 90) percent = 90;
+                    progressBar.style.width = `${percent}%`;
+                    percentText.innerText = `${percent}%`;
+                    
+                    if (percent < 30) {
+                        statusText.innerText = "Register-blokgroottes testen (max_gap)...";
+                    } else if (percent < 60) {
+                        statusText.innerText = "Wachttijden scannen (delay_between_requests)...";
+                    } else {
+                        statusText.innerText = "Optimaliteit en foutmarges berekenen...";
+                    }
+                }
+            }, 300);
+            
             const optimizeURL = ingressPath + "/api/optimize";
-            apiFetch(optimizeURL, {
+            fetch(optimizeURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -2806,24 +2499,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 body: JSON.stringify({ slave: slaveId })
             })
             .then(response => {
+                clearInterval(progressInterval);
                 if (!response.ok) throw new Error("Fout status code: " + response.status);
                 return response.json();
             })
             .then(result => {
-                if (result.success && result.task_id) {
-                    pollTaskStatus(result.task_id, 'optimizer', slaveId, 0);
+                progressBar.style.width = "100%";
+                percentText.innerText = "100%";
+                statusText.innerText = "Optimalisatie voltooid!";
+                
+                btn.disabled = false;
+                btn.innerText = "⚡ Optimaliseer & Stress-test";
+                
+                if (result.success) {
+                    displayOptimizationResults(slaveId, result);
                 } else {
-                    btn.disabled = false;
-                    btn.innerText = "⚡ Optimaliseer & Stress-test";
                     resultsContainer.innerHTML = `
                         <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
-                            <strong>❌ Stress-test opstarten mislukt:</strong><br>${result.error || 'Onbekende fout'}
+                            <strong>❌ Stress-test mislukt:</strong><br>${result.error || 'Onbekende fout'}
                         </div>
                     `;
                     resultsContainer.style.display = "block";
                 }
             })
             .catch(err => {
+                clearInterval(progressInterval);
                 btn.disabled = false;
                 btn.innerText = "⚡ Optimaliseer & Stress-test";
                 
@@ -2894,7 +2594,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             btn.innerText = "⏳ Bezig met opslaan...";
             
             const applyURL = ingressPath + "/api/apply-settings";
-            apiFetch(applyURL, {
+            fetch(applyURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -2959,20 +2659,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const progressBar = document.getElementById('scan-progress-bar');
             const resultsContainer = document.getElementById('scan-results-container');
             const alertContainer = document.getElementById('scan-alert-container');
-            const logConsole = document.getElementById('scan-log-console');
             
             progressContainer.style.display = "block";
             resultsContainer.style.display = "none";
             alertContainer.innerHTML = '';
-            logConsole.style.display = "block";
-            logConsole.innerHTML = "";
             
             progressBar.style.width = "0%";
             percentText.innerText = "0%";
             statusText.innerText = "Modbus verbinding controleren...";
             
+            let percent = 0;
+            const progressInterval = setInterval(() => {
+                if (percent < 90) {
+                    percent += Math.floor(Math.random() * 8) + 2;
+                    if (percent > 90) percent = 90;
+                    progressBar.style.width = `${percent}%`;
+                    percentText.innerText = `${percent}%`;
+                    statusText.innerText = `Registers scannen (${percent}%)...`;
+                }
+            }, 400);
+            
             const scanURL = ingressPath + "/api/scan-registers";
-            apiFetch(scanURL, {
+            fetch(scanURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -2985,19 +2693,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 })
             })
             .then(response => {
+                clearInterval(progressInterval);
                 if (!response.ok) throw new Error("Fout status code: " + response.status);
                 return response.json();
             })
             .then(result => {
-                if (result.success && result.task_id) {
-                    pollTaskStatus(result.task_id, 'scanner', slaveId, 0);
+                progressBar.style.width = "100%";
+                percentText.innerText = "100%";
+                statusText.innerText = "Scan voltooid!";
+                
+                btn.disabled = false;
+                btn.innerText = "⚡ Start Scan";
+                
+                if (result.success) {
+                    currentScanResults = result.results;
+                    displayScanResults(result.results);
                 } else {
-                    btn.disabled = false;
-                    btn.innerText = "⚡ Start Scan";
                     resultsContainer.style.display = "block";
                     alertContainer.innerHTML = `
                         <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
-                            <strong>❌ Scan opstarten mislukt:</strong><br>${result.error || 'Onbekende fout'}
+                            <strong>❌ Scan mislukt:</strong><br>${result.error || 'Onbekende fout'}
                         </div>
                     `;
                     document.getElementById('scan-table-body').innerHTML = '<tr><td colspan="4" class="text-center">Scan mislukt.</td></tr>';
@@ -3006,6 +2721,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
             })
             .catch(err => {
+                clearInterval(progressInterval);
                 btn.disabled = false;
                 btn.innerText = "⚡ Start Scan";
                 
@@ -3238,7 +2954,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             btn.innerText = "⏳ Bezig met toevoegen...";
             
             const addURL = ingressPath + "/api/add-sensors";
-            fetch(addURL, { credentials: 'include',
+            fetch(addURL, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json'
@@ -3271,14 +2987,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         function updateDashboard() {
             if (activeTab !== 'dashboard') return;
             
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 8000);
-            
-            apiFetch(apiURL, { signal: controller.signal })
-                .then(response => {
-                    clearTimeout(timeoutId);
-                    return response.json();
-                })
+            fetch(apiURL)
+                .then(response => response.json())
                 .then(data => {
                     // Update status badge
                     const statusBadge = document.getElementById('bridge-status-badge');
@@ -3349,11 +3059,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     }
                 })
                 .catch(err => {
-                    const errType = err.name === 'AbortError' ? 'Timeout (>8s)' : err.message || err.name;
-                    console.error("Fout bij ophalen status:", errType, "URL:", apiURL);
-                    document.getElementById('bridge-status-badge').innerHTML = 
-                        `<span class="badge badge-danger" title="${apiURL}: ${errType}">Fout: ${errType}</span>`;
-                    document.getElementById('uptime-val').innerText = apiURL;
+                    console.error("Fout bij ophalen status:", err);
+                    document.getElementById('bridge-status-badge').innerHTML = '<span class="badge badge-danger">Fout bij laden</span>';
                 });
         }
         
