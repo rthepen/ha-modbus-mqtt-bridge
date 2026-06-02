@@ -143,7 +143,11 @@ class ModbusMqttBridge:
                         "host": ha_options.get("modbus_host", "192.168.50.96"),
                         "port": ha_options.get("modbus_port", 41),
                         "timeout": 3,
-                        "poll_interval": ha_options.get("poll_interval", 15)
+                        "poll_interval": ha_options.get("poll_interval", 15),
+                        "retries": ha_options.get("retries", 3),
+                        "delay_between_requests": ha_options.get("delay_between_requests", 0.1),
+                        "max_gap": ha_options.get("max_gap", 10),
+                        "slave_retries": ha_options.get("slave_retries", {})
                     },
                     "log_level": ha_options.get("log_level", "info"),
                     "sensors": []
@@ -183,6 +187,13 @@ class ModbusMqttBridge:
                 logger.error(f"Fout bij parsen van YAML: {e}")
                 sys.exit(1)
 
+        # Zorg voor veilige defaults voor de geavanceerde Modbus-instellingen
+        modbus_cfg = self.config.setdefault("modbus", {})
+        modbus_cfg.setdefault("retries", 3)
+        modbus_cfg.setdefault("delay_between_requests", 0.1)
+        modbus_cfg.setdefault("max_gap", 10)
+        modbus_cfg.setdefault("slave_retries", {})
+
         # Configureer loggers gebaseerd op log_level uit de config, tenzij debug op CLI is meegegeven
         if not self.debug:
             log_level_str = str(self.config.get("log_level", "info")).upper()
@@ -199,6 +210,9 @@ class ModbusMqttBridge:
                 logging.getLogger("pymodbus").setLevel(logging.WARNING)
             
             logger.info(f"Log-level ingesteld op: {log_level_str}")
+
+        # Groepeer sensoren voor block reading
+        self.group_sensors()
 
     # --------------------------------------------------------------------------
     # MQTT Functionaliteiten
@@ -596,8 +610,24 @@ class ModbusMqttBridge:
                 modbus_logger.error(f"Fout: Alleen holding registers zijn schrijfbaar (sensor {uid} heeft type {reg_type})")
                 return
                 
-            res = self.modbus_client.write_register(address=address, value=val, device_id=slave)
-            if res.isError():
+            max_retries = self.get_slave_retries(slave)
+            delay = float(self.config.get("modbus", {}).get("delay_between_requests", 0.1))
+            res = None
+            attempt = 0
+            while attempt <= max_retries:
+                if attempt > 0:
+                    modbus_logger.info(f"Retry {attempt}/{max_retries} voor schrijven naar register {address} op slave {slave} met waarde {val}...")
+                    time.sleep(delay)
+                try:
+                    res = self.modbus_client.write_register(address=address, value=val, device_id=slave)
+                    if res is not None and not res.isError():
+                        break
+                except Exception as e:
+                    modbus_logger.error(f"Fout bij schrijven naar Modbus (poging {attempt}): {e}")
+                    res = None
+                attempt += 1
+
+            if res is None or res.isError():
                 modbus_logger.error(f"Fout bij schrijven naar Modbus voor {uid}: {res}")
                 if self.modbus_client:
                     self.modbus_client.close()
@@ -710,49 +740,252 @@ class ModbusMqttBridge:
     # --------------------------------------------------------------------------
     # Hoofd Polling Loop
     # --------------------------------------------------------------------------
-    def poll_all_sensors(self):
-        """Lees alle geconfigureerde sensoren en publiceer hun waarden."""
+    def group_sensors(self):
+        """
+        Groepeer sensoren in optimale Modbus-blokken per slave en register_type.
+        Dit vermindert het aantal polling verzoeken drastisch.
+        """
         sensors = self.config.get("sensors", [])
-        logger.info(f"Starten pollingronde voor {len(sensors)} sensoren...")
+        if not sensors:
+            self.sensor_blocks = []
+            return
+
+        modbus_cfg = self.config.get("modbus", {})
+        max_gap = int(modbus_cfg.get("max_gap", 10))
+
+        # Groepeer sensoren per (slave, register_type)
+        grouped = {}
+        for s in sensors:
+            slave = int(s.get("slave", 1))
+            reg_type = s.get("register_type", "holding")
+            key = (slave, reg_type)
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(s)
+
+        self.sensor_blocks = []
+
+        for (slave, reg_type), slave_sensors in grouped.items():
+            sensor_ranges = []
+            for s in slave_sensors:
+                addr = int(s.get("address", 0))
+                count = 2 if s.get("data_type") in ("int32", "uint32") else 1
+                sensor_ranges.append({
+                    "sensor": s,
+                    "start": addr,
+                    "end": addr + count - 1,
+                    "count": count
+                })
+
+            # Sorteer op start adres
+            sensor_ranges.sort(key=lambda x: x["start"])
+
+            # Voeg samen tot blokken met een maximale kloof van `max_gap` en max block size van 120 registers
+            current_block = None
+            for r in sensor_ranges:
+                if current_block is None:
+                    current_block = {
+                        "slave": slave,
+                        "register_type": reg_type,
+                        "start": r["start"],
+                        "end": r["end"],
+                        "sensors": [r["sensor"]]
+                    }
+                else:
+                    gap = r["start"] - current_block["end"] - 1
+                    new_size = r["end"] - current_block["start"] + 1
+                    
+                    if gap <= max_gap and new_size <= 120:
+                        current_block["end"] = max(current_block["end"], r["end"])
+                        current_block["sensors"].append(r["sensor"])
+                    else:
+                        self.sensor_blocks.append(current_block)
+                        current_block = {
+                            "slave": slave,
+                            "register_type": reg_type,
+                            "start": r["start"],
+                            "end": r["end"],
+                            "sensors": [r["sensor"]]
+                        }
+            if current_block:
+                self.sensor_blocks.append(current_block)
+
+        logger.info(f"Sensoren gegroepeerd in {len(self.sensor_blocks)} Modbus-blokken (Totaal: {len(sensors)} sensoren).")
+
+    def get_slave_retries(self, slave):
+        """Haal het aantal toegestane retries op voor een specifiek Slave ID."""
+        modbus_cfg = self.config.get("modbus", {})
+        slave_retries = modbus_cfg.get("slave_retries", {})
+        
+        ret = slave_retries.get(str(slave))
+        if ret is None:
+            ret = slave_retries.get(int(slave))
+        if ret is None:
+            ret = modbus_cfg.get("retries", 3)
+        return int(ret)
+
+    def read_block(self, block):
+        """Lees een heel Modbus-blok uit."""
+        slave = block["slave"]
+        reg_type = block["register_type"]
+        start_addr = block["start"]
+        count = block["end"] - start_addr + 1
+
+        modbus_logger.debug(f"Blok inlezen (Slave: {slave}, Type: {reg_type}, Adres: {start_addr}, Aantal: {count})")
+
+        # Modbus verbinding controleren/herstellen
+        if not self.modbus_client or not self.modbus_client.connected:
+            modbus_logger.warning("Modbus client niet verbonden. Poging tot herverbinden...")
+            if not self.connect_modbus():
+                return None
+
+        try:
+            if reg_type == "holding":
+                res = self.modbus_client.read_holding_registers(address=start_addr, count=count, device_id=slave)
+            elif reg_type == "input":
+                res = self.modbus_client.read_input_registers(address=start_addr, count=count, device_id=slave)
+            else:
+                modbus_logger.error(f"Onbekend register type: {reg_type} voor blok")
+                return None
+
+            if res.isError():
+                modbus_logger.error(f"Fout bij uitlezen blok (Slave {slave}, Adres {start_addr}, Aantal {count}): {res}")
+                if self.modbus_client:
+                    self.modbus_client.close()
+                return None
+
+            return res.registers
+
+        except Exception as e:
+            modbus_logger.error(f"Exception bij uitlezen blok: {e}")
+            if self.modbus_client:
+                try:
+                    self.modbus_client.close()
+                except Exception:
+                    pass
+            return None
+
+    # --------------------------------------------------------------------------
+    # Hoofd Polling Loop
+    # --------------------------------------------------------------------------
+    def poll_all_sensors(self):
+        """Lees alle sensoren uit via geoptimaliseerde blokken met fallback."""
+        if not hasattr(self, "sensor_blocks") or not self.sensor_blocks:
+            self.group_sensors()
+            if not self.sensor_blocks:
+                logger.warning("Geen sensoren geconfigureerd om te polliceren.")
+                return
+
+        modbus_cfg = self.config.get("modbus", {})
+        delay = float(modbus_cfg.get("delay_between_requests", 0.1))
         
         self.stats["total_polls"] += 1
-        
+        logger.info(f"Starten pollingronde via {len(self.sensor_blocks)} Modbus-blokken...")
+
         failed_slaves = set()
         success_count = 0
         slaves_marked_online = set()
-        
-        for s in sensors:
-            slave = s.get("slave", 1)
-            uid = s.get("unique_id")
-            
-            # Sla over als deze slave al gemarkeerd is als mislukt in deze pollingronde
+
+        for block in self.sensor_blocks:
+            slave = block["slave"]
+            reg_type = block["register_type"]
+            start_addr = block["start"]
+            block_sensors = block["sensors"]
+
+            # Sla het blok over als deze slave al gemarkeerd is als gefaald in deze ronde
             if slave in failed_slaves:
-                modbus_logger.debug(f"Sla {uid} over omdat Slave {slave} in deze ronde al gefaald is.")
-                self.stats["failed_reads"] += 1
+                self.stats["failed_reads"] += len(block_sensors)
                 continue
-                
-            val = self.read_sensor(s)
+
+            max_retries = self.get_slave_retries(slave)
             
-            if val is not None:
-                self.publish_sensor_value(uid, val)
-                success_count += 1
-                self.stats["successful_reads"] += 1
-                
-                # Markeer als online als we dat nog niet hebben gedaan in deze ronde
+            registers = None
+            attempt = 0
+            
+            while attempt <= max_retries:
+                if attempt > 0:
+                    modbus_logger.info(f"Retry {attempt}/{max_retries} voor Blok (Slave {slave}, Adres {start_addr})...")
+                    time.sleep(delay)
+
+                registers = self.read_block(block)
+                if registers is not None:
+                    break
+                attempt += 1
+
+            if registers is not None:
+                for s in block_sensors:
+                    uid = s.get("unique_id")
+                    addr = int(s.get("address", 0))
+                    count = 2 if s.get("data_type") in ("int32", "uint32") else 1
+                    
+                    offset = addr - start_addr
+                    
+                    if offset >= 0 and offset + count <= len(registers):
+                        sensor_regs = registers[offset : offset + count]
+                        
+                        if count == 2:
+                            raw_value = (sensor_regs[0] << 16) | sensor_regs[1]
+                            if s.get("data_type") == "int32" and raw_value >= 2147483648:
+                                raw_value -= 4294967296
+                            debug_raw = f"{sensor_regs[0]},{sensor_regs[1]} ({raw_value})"
+                        else:
+                            raw_value = sensor_regs[0]
+                            if s.get("data_type", "int16") == "int16" and raw_value >= 32768:
+                                raw_value -= 65536
+                            debug_raw = str(sensor_regs[0])
+
+                        scale = s.get("scale", 1.0)
+                        precision = s.get("precision", 0)
+                        calculated_value = round(raw_value * scale, precision) if precision > 0 else int(round(raw_value * scale))
+                        
+                        modbus_logger.debug(f"Gelezen {uid} via blok: Raw={debug_raw} -> Berekend={calculated_value}")
+                        self.publish_sensor_value(uid, calculated_value)
+                        success_count += 1
+                        self.stats["successful_reads"] += 1
+                    else:
+                        modbus_logger.error(f"Offset buiten bereik voor sensor {uid} in blok: offset={offset}, len={len(registers)}")
+                        self.stats["failed_reads"] += 1
+
                 if slave not in slaves_marked_online:
                     self.publish_slave_connectivity(slave, "ON")
                     slaves_marked_online.add(slave)
             else:
-                # Markeer als mislukt zodat we overige registers voor deze slave overslaan in deze ronde
-                failed_slaves.add(slave)
-                self.publish_slave_connectivity(slave, "OFF")
-                self.stats["failed_reads"] += 1
-                modbus_logger.warning(f"Slave {slave} reageert niet. Resterende sensors voor deze slave in deze pollingronde worden overgeslagen.")
+                modbus_logger.warning(f"Blok uitlezen mislukt voor Slave {slave}, Adres {start_addr}. Fallback naar individuele sensoren...")
                 
-            # Wacht heel even tussen verzoeken om bus-collisies op de RS485-lijn te minimaliseren
-            time.sleep(0.1)
-            
-        logger.info(f"Pollingronde voltooid. {success_count}/{len(sensors)} succesvol uitgelezen.")
+                block_failed = False
+                for s in block_sensors:
+                    uid = s.get("unique_id")
+                    
+                    val = None
+                    indiv_attempt = 0
+                    while indiv_attempt <= max_retries:
+                        if indiv_attempt > 0:
+                            time.sleep(delay)
+                        val = self.read_sensor(s)
+                        if val is not None:
+                            break
+                        indiv_attempt += 1
+
+                    if val is not None:
+                        self.publish_sensor_value(uid, val)
+                        success_count += 1
+                        self.stats["successful_reads"] += 1
+                    else:
+                        block_failed = True
+                        self.stats["failed_reads"] += 1
+
+                if block_failed:
+                    failed_slaves.add(slave)
+                    self.publish_slave_connectivity(slave, "OFF")
+                    modbus_logger.warning(f"Slave {slave} reageert niet na individuele fallback. Resterende blokken voor deze slave worden overgeslagen.")
+                else:
+                    if slave not in slaves_marked_online:
+                        self.publish_slave_connectivity(slave, "ON")
+                        slaves_marked_online.add(slave)
+
+            time.sleep(delay)
+
+        logger.info(f"Pollingronde voltooid. {success_count} metingen succesvol verwerkt.")
 
     def run_once(self):
         """Voer één enkele polling uit en sluit af (handig voor testen/CLI)."""
