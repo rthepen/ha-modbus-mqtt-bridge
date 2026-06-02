@@ -1343,6 +1343,160 @@ class ModbusMqttBridge:
         except Exception as e:
             raise ValueError(f"Fout bij opslaan van nieuwe instellingen: {e}")
 
+    def scan_range(self, slave, reg_type, start_addr, quantity):
+        """Scant een specifieke reeks registers in blokken en valt terug op individueel."""
+        results = []
+        block_size = 20
+        for block_start in range(start_addr, start_addr + quantity, block_size):
+            block_count = min(block_size, start_addr + quantity - block_start)
+            block = {
+                "slave": slave,
+                "register_type": reg_type,
+                "start": block_start,
+                "end": block_start + block_count - 1
+            }
+            
+            regs = self.read_block(block)
+            if regs is not None:
+                for i in range(len(regs)):
+                    results.append({
+                        "address": block_start + i,
+                        "register_type": reg_type,
+                        "value_16": regs[i]
+                    })
+            else:
+                for addr in range(block_start, block_start + block_count):
+                    single_block = {
+                        "slave": slave,
+                        "register_type": reg_type,
+                        "start": addr,
+                        "end": addr
+                    }
+                    val = self.read_block(single_block)
+                    if val is not None and len(val) > 0:
+                        results.append({
+                            "address": addr,
+                            "register_type": reg_type,
+                            "value_16": val[0]
+                        })
+                    time.sleep(0.01)
+        return results
+
+    def scan_registers(self, slave_id, register_type, start_addr, quantity):
+        """Scant holding en/of input registers op een slave met de modbus lock."""
+        slave_id = int(slave_id)
+        start_addr = int(start_addr)
+        quantity = int(quantity)
+        
+        if quantity <= 0 or quantity > 1000:
+            return {"success": False, "error": "Aantal te scannen registers moet tussen 1 en 1000 liggen."}
+            
+        logger.info(f"🏁 Starten Modbus register scan op Slave {slave_id} (Type: {register_type}, Bereik: {start_addr}-{start_addr+quantity-1})...")
+        
+        raw_results = []
+        types_to_scan = []
+        if register_type in ("holding", "both"):
+            types_to_scan.append("holding")
+        if register_type in ("input", "both"):
+            types_to_scan.append("input")
+            
+        with self.modbus_lock:
+            for reg_type in types_to_scan:
+                try:
+                    type_results = self.scan_range(slave_id, reg_type, start_addr, quantity)
+                    raw_results.extend(type_results)
+                except Exception as e:
+                    logger.error(f"Fout tijdens scan op {reg_type} registers: {e}")
+                    
+        # Bouw een dictionary van (reg_type, adres) -> 16-bit waarde voor snelle lookup
+        vals_map = {(r["register_type"], r["address"]): r["value_16"] for r in raw_results}
+        
+        results = []
+        for r in raw_results:
+            addr = r["address"]
+            reg_type = r["register_type"]
+            val16 = r["value_16"]
+            
+            val_int16 = val16 - 65536 if val16 >= 32768 else val16
+            val_uint16 = val16
+            
+            item = {
+                "address": addr,
+                "register_type": reg_type,
+                "val_int16": val_int16,
+                "val_uint16": val_uint16
+            }
+            
+            # Controleer of het opvolgende register ook succesvol gelezen is (voor 32-bit datatypes)
+            if (reg_type, addr + 1) in vals_map:
+                val16_next = vals_map[(reg_type, addr + 1)]
+                val32 = (val16 << 16) | val16_next
+                val_int32 = val32 - 4294967296 if val32 >= 2147483648 else val32
+                val_uint32 = val32
+                item["val_int32"] = val_int32
+                item["val_uint32"] = val_uint32
+                
+            results.append(item)
+            
+        logger.info(f"🔍 Scan voltooid op Slave {slave_id}. {len(results)} actieve registers gevonden.")
+        return {
+            "success": True,
+            "slave": slave_id,
+            "results": results
+        }
+
+    def add_sensors(self, new_sensors):
+        """Voegt een lijst met gescande sensoren toe aan config.yaml en herlaadt."""
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            config_data = yaml.safe_load(content) or {}
+        except Exception as e:
+            raise ValueError(f"Kan huidige configuratie niet inlezen: {e}")
+
+        sensors_list = config_data.setdefault("sensors", [])
+        existing_ids = {s.get("unique_id") for s in sensors_list if s.get("unique_id")}
+        
+        for s in new_sensors:
+            uid = s.get("unique_id")
+            if not uid:
+                raise ValueError("Elke sensor moet een unique_id hebben.")
+            if uid in existing_ids:
+                raise ValueError(f"Sensor met unique_id '{uid}' bestaat al.")
+            
+            sensor_entry = {
+                "name": str(s.get("name")),
+                "unique_id": str(uid),
+                "slave": int(s.get("slave", 1)),
+                "register_type": str(s.get("register_type", "holding")),
+                "address": int(s.get("address", 0)),
+                "data_type": str(s.get("data_type", "int16")),
+                "scale": float(s.get("scale", 1.0)),
+                "precision": int(s.get("precision", 0)),
+                "unit_of_measurement": str(s.get("unit_of_measurement", "")),
+                "device_class": str(s.get("device_class", "")),
+                "state_class": str(s.get("state_class", "measurement"))
+            }
+            
+            if s.get("writeable"):
+                sensor_entry["writeable"] = True
+                
+            if s.get("entity_type") and s.get("entity_type") != "sensor":
+                sensor_entry["entity_type"] = str(s.get("entity_type"))
+                if sensor_entry["entity_type"] == "number":
+                    sensor_entry["min"] = s.get("min", 0)
+                    sensor_entry["max"] = s.get("max", 100)
+                    sensor_entry["step"] = s.get("step", 1)
+
+            sensors_list.append(sensor_entry)
+
+        try:
+            new_yaml = yaml.dump(config_data, allow_unicode=True, sort_keys=False)
+            self.reload_configuration(new_yaml)
+            return {"success": True, "message": f"{len(new_sensors)} sensoren succesvol toegevoegd en hergeladen!"}
+        except Exception as e:
+            raise ValueError(f"Fout bij opslaan van nieuwe sensoren: {e}")
+
     def reload_configuration(self, new_yaml_content):
         """Valideer de ingevoerde YAML, schrijf deze naar config.yaml en herlaad verbindingen."""
         try:
@@ -1527,6 +1681,56 @@ class StatusHTTPRequestHandler(BaseHTTPRequestHandler):
                 
                 # Sla de instellingen op
                 result = self.server.bridge.apply_settings(slave, max_gap, delay)
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+        elif path.endswith("/api/scan-registers"):
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                params = json.loads(post_data)
+                slave = int(params.get("slave"))
+                reg_type = str(params.get("register_type", "holding"))
+                start_addr = int(params.get("start_address", 0))
+                quantity = int(params.get("quantity", 100))
+                
+                # Voer scan uit
+                result = self.server.bridge.scan_registers(slave, reg_type, start_addr, quantity)
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps(result).encode('utf-8'))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "error": str(e)}).encode('utf-8'))
+        elif path.endswith("/api/add-sensors"):
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            
+            try:
+                params = json.loads(post_data)
+                new_sensors = params.get("sensors", [])
+                
+                if not isinstance(new_sensors, list) or not new_sensors:
+                    raise ValueError("Ongeldige of lege lijst met sensoren.")
+                
+                # Sla de sensoren op
+                result = self.server.bridge.add_sensors(new_sensors)
                 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -1899,6 +2103,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button id="btn-tab-dashboard" class="tab-btn active" onclick="switchTab('dashboard')">📊 Status Dashboard</button>
             <button id="btn-tab-editor" class="tab-btn" onclick="switchTab('editor')">📝 Configuratie Editor</button>
             <button id="btn-tab-optimizer" class="tab-btn" onclick="switchTab('optimizer')">⚙️ Optimalisatie</button>
+            <button id="btn-tab-scanner" class="tab-btn" onclick="switchTab('scanner')">🔍 Register Scanner</button>
         </div>
         
         <!-- Tab 1: Dashboard -->
@@ -1973,6 +2178,87 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div id="optimizer-list" class="grid" style="grid-template-columns: 1fr;">
                     <div class="card">
                         <div class="text-center">Gegevens laden...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Tab 4: Register Scanner -->
+        <div id="tab-scanner" class="tab-content">
+            <div class="editor-container">
+                <div class="section-title">🔍 Modbus Register Scanner</div>
+                <p style="color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.95rem;">
+                    Scan een reeks registers op een specifieke Modbus slave om actieve adressen op te sporen en voeg ze rechtstreeks toe aan je sensorenlijst.
+                </p>
+                <div class="card" style="margin-bottom: 1.5rem;">
+                    <div style="display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end;">
+                        <div style="flex: 1; min-width: 120px;">
+                            <label style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.35rem; color: var(--text-muted);">Slave ID</label>
+                            <input type="number" id="scan-slave-id" value="1" min="1" max="255" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 8px; color: #fff; outline: none;">
+                        </div>
+                        <div style="flex: 2; min-width: 180px;">
+                            <label style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.35rem; color: var(--text-muted);">Register Type</label>
+                            <select id="scan-register-type" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 8px; color: #fff; outline: none;">
+                                <option value="holding">Holding Registers</option>
+                                <option value="input">Input Registers</option>
+                                <option value="both">Beide Types</option>
+                            </select>
+                        </div>
+                        <div style="flex: 1.5; min-width: 120px;">
+                            <label style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.35rem; color: var(--text-muted);">Start Adres</label>
+                            <input type="number" id="scan-start-addr" value="0" min="0" max="65535" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 8px; color: #fff; outline: none;">
+                        </div>
+                        <div style="flex: 1.5; min-width: 120px;">
+                            <label style="display: block; font-size: 0.85rem; font-weight: 600; margin-bottom: 0.35rem; color: var(--text-muted);">Aantal te scannen</label>
+                            <input type="number" id="scan-quantity" value="100" min="1" max="1000" style="width: 100%; padding: 0.5rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 8px; color: #fff; outline: none;">
+                        </div>
+                        <div>
+                            <button class="btn btn-primary" id="btn-start-scan" onclick="startRegisterScan()">⚡ Start Scan</button>
+                        </div>
+                    </div>
+                    
+                    <!-- Scan Voortgangsindicator -->
+                    <div id="scan-progress-container" style="display: none; margin-top: 1.5rem; border-top: 1px solid var(--card-border); padding-top: 1rem;">
+                        <div style="display: flex; justify-content: space-between; font-size: 0.9rem; margin-bottom: 0.5rem;">
+                            <span id="scan-status-text" style="color: var(--primary); font-weight: 600;">Bezig met scannen...</span>
+                            <span id="scan-percent-text">0%</span>
+                        </div>
+                        <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; border: 1px solid var(--card-border);">
+                            <div id="scan-progress-bar" style="width: 0%; height: 100%; background: var(--primary); transition: width 0.2s;"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Scan Resultaten -->
+                <div id="scan-results-container" style="display: none;">
+                    <div class="section-title">🔍 Gevonden Actieve Registers</div>
+                    <div id="scan-alert-container"></div>
+                    <table style="margin-bottom: 1.5rem;">
+                        <thead>
+                            <tr>
+                                <th style="width: 40px; text-align: center;"><input type="checkbox" id="scan-select-all" onclick="toggleSelectAllScan(this)"></th>
+                                <th>Adres</th>
+                                <th>Type</th>
+                                <th>Gevonden Waarde (Verschillende Datatypes)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="scan-table-body">
+                            <!-- Dynamisch ingevuld -->
+                        </tbody>
+                    </table>
+                    
+                    <!-- Dynamic Configurations Form for selected registers -->
+                    <div id="scan-configs-container" style="display: none; margin-bottom: 1.5rem;">
+                        <div class="section-title">✏️ Configureer Geselecteerde Sensoren</div>
+                        <div id="scan-config-forms-list">
+                            <!-- Hier komen de configuratie formulieren per geselecteerd register -->
+                        </div>
+                        
+                        <div style="display: flex; justify-content: flex-end; margin-top: 1.5rem;">
+                            <button class="btn btn-primary" id="btn-save-scanned" onclick="saveScannedSensors()" style="background-color: var(--success);">
+                                ➕ Voeg geselecteerde sensoren toe aan configuratie
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -2339,6 +2625,362 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 alert("Netwerkfout bij opslaan: " + err.message);
                 btn.disabled = false;
                 btn.innerText = "✅ Toepassen & Opslaan";
+            });
+        }
+
+        let currentScanResults = [];
+
+        function startRegisterScan() {
+            const slaveId = parseInt(document.getElementById('scan-slave-id').value);
+            const regType = document.getElementById('scan-register-type').value;
+            const startAddr = parseInt(document.getElementById('scan-start-addr').value);
+            const quantity = parseInt(document.getElementById('scan-quantity').value);
+            
+            if (isNaN(slaveId) || slaveId < 1 || slaveId > 255) {
+                alert("Vul een geldig Slave ID in (1-255).");
+                return;
+            }
+            if (isNaN(startAddr) || startAddr < 0 || startAddr > 65535) {
+                alert("Vul een geldig startadres in (0-65535).");
+                return;
+            }
+            if (isNaN(quantity) || quantity < 1 || quantity > 1000) {
+                alert("Aantal te scannen registers moet liggen tussen 1 en 1000.");
+                return;
+            }
+            
+            const btn = document.getElementById('btn-start-scan');
+            btn.disabled = true;
+            btn.innerText = "⏳ Scannen...";
+            
+            const progressContainer = document.getElementById('scan-progress-container');
+            const statusText = document.getElementById('scan-status-text');
+            const percentText = document.getElementById('scan-percent-text');
+            const progressBar = document.getElementById('scan-progress-bar');
+            const resultsContainer = document.getElementById('scan-results-container');
+            const alertContainer = document.getElementById('scan-alert-container');
+            
+            progressContainer.style.display = "block";
+            resultsContainer.style.display = "none";
+            alertContainer.innerHTML = '';
+            
+            progressBar.style.width = "0%";
+            percentText.innerText = "0%";
+            statusText.innerText = "Modbus verbinding controleren...";
+            
+            let percent = 0;
+            const progressInterval = setInterval(() => {
+                if (percent < 90) {
+                    percent += Math.floor(Math.random() * 8) + 2;
+                    if (percent > 90) percent = 90;
+                    progressBar.style.width = `${percent}%`;
+                    percentText.innerText = `${percent}%`;
+                    statusText.innerText = `Registers scannen (${percent}%)...`;
+                }
+            }, 400);
+            
+            const scanURL = ingressPath + "/api/scan-registers";
+            fetch(scanURL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    slave: slaveId,
+                    register_type: regType,
+                    start_address: startAddr,
+                    quantity: quantity
+                })
+            })
+            .then(response => {
+                clearInterval(progressInterval);
+                if (!response.ok) throw new Error("Fout status code: " + response.status);
+                return response.json();
+            })
+            .then(result => {
+                progressBar.style.width = "100%";
+                percentText.innerText = "100%";
+                statusText.innerText = "Scan voltooid!";
+                
+                btn.disabled = false;
+                btn.innerText = "⚡ Start Scan";
+                
+                if (result.success) {
+                    currentScanResults = result.results;
+                    displayScanResults(result.results);
+                } else {
+                    resultsContainer.style.display = "block";
+                    alertContainer.innerHTML = `
+                        <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
+                            <strong>❌ Scan mislukt:</strong><br>${result.error || 'Onbekende fout'}
+                        </div>
+                    `;
+                    document.getElementById('scan-table-body').innerHTML = '<tr><td colspan="4" class="text-center">Scan mislukt.</td></tr>';
+                    document.getElementById('scan-select-all').checked = false;
+                    document.getElementById('scan-configs-container').style.display = "none";
+                }
+            })
+            .catch(err => {
+                clearInterval(progressInterval);
+                btn.disabled = false;
+                btn.innerText = "⚡ Start Scan";
+                
+                progressBar.style.width = "100%";
+                progressBar.style.backgroundColor = "var(--danger)";
+                statusText.innerText = "Fout opgetreden.";
+                statusText.style.color = "var(--danger)";
+                
+                resultsContainer.style.display = "block";
+                alertContainer.innerHTML = `
+                    <div class="alert-box alert-box-danger" style="margin-bottom: 0;">
+                        <strong>❌ Netwerkfout tijdens scan:</strong><br>${err.message || err}
+                    </div>
+                `;
+                document.getElementById('scan-table-body').innerHTML = '<tr><td colspan="4" class="text-center">Verbindingsfout.</td></tr>';
+                document.getElementById('scan-select-all').checked = false;
+                document.getElementById('scan-configs-container').style.display = "none";
+            });
+        }
+
+        function displayScanResults(results) {
+            const resultsContainer = document.getElementById('scan-results-container');
+            const tbody = document.getElementById('scan-table-body');
+            const selectAllBox = document.getElementById('scan-select-all');
+            
+            resultsContainer.style.display = "block";
+            selectAllBox.checked = false;
+            document.getElementById('scan-configs-container').style.display = "none";
+            
+            if (results.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="text-center">Geen actieve registers gevonden in deze reeks.</td></tr>';
+                return;
+            }
+            
+            let html = '';
+            results.forEach(r => {
+                const valStr = `int16: <strong>${r.val_int16}</strong> | uint16: <strong>${r.val_uint16}</strong>` +
+                    (r.val_int32 !== undefined ? ` | int32: <strong>${r.val_int32}</strong> | uint32: <strong>${r.val_uint32}</strong>` : '');
+                    
+                html += `
+                    <tr>
+                        <td style="text-align: center;">
+                            <input type="checkbox" class="scan-row-checkbox" data-addr="${r.address}" data-type="${r.register_type}" onclick="handleScanRowSelect()">
+                        </td>
+                        <td style="font-weight: 600; font-family: monospace;">${r.address}</td>
+                        <td><span class="badge" style="background: rgba(255,255,255,0.05); border: 1px solid var(--card-border); color: #fff;">${r.register_type}</span></td>
+                        <td style="font-family: monospace; font-size: 0.95rem;">${valStr}</td>
+                    </tr>
+                `;
+            });
+            
+            tbody.innerHTML = html;
+        }
+
+        function toggleSelectAllScan(box) {
+            document.querySelectorAll('.scan-row-checkbox').forEach(cb => {
+                cb.checked = box.checked;
+            });
+            handleScanRowSelect();
+        }
+
+        function handleScanRowSelect() {
+            const listContainer = document.getElementById('scan-config-forms-list');
+            const configsContainer = document.getElementById('scan-configs-container');
+            
+            const checkedRows = Array.from(document.querySelectorAll('.scan-row-checkbox:checked'));
+            
+            if (checkedRows.length === 0) {
+                configsContainer.style.display = "none";
+                listContainer.innerHTML = '';
+                return;
+            }
+            
+            configsContainer.style.display = "block";
+            
+            let html = '';
+            const slaveId = parseInt(document.getElementById('scan-slave-id').value) || 1;
+            
+            checkedRows.forEach(row => {
+                const addr = parseInt(row.getAttribute('data-addr'));
+                const regType = row.getAttribute('data-type');
+                
+                const item = currentScanResults.find(r => r.address === addr && r.register_type === regType);
+                if (!item) return;
+                
+                const formId = `scan-form-${regType}-${addr}`;
+                const nameVal = document.getElementById(`${formId}-name`)?.value || `Slave ${slaveId} Reg ${addr}`;
+                const uidVal = document.getElementById(`${formId}-uid`)?.value || `slave_${slaveId}_reg_${addr}`;
+                const dataTypeVal = document.getElementById(`${formId}-datatype`)?.value || 'int16';
+                const scaleVal = document.getElementById(`${formId}-scale`)?.value || '1.0';
+                const precVal = document.getElementById(`${formId}-prec`)?.value || '0';
+                const unitVal = document.getElementById(`${formId}-unit`)?.value || '';
+                const devClassVal = document.getElementById(`${formId}-devclass`)?.value || '';
+                const stateClassVal = document.getElementById(`${formId}-stateclass`)?.value || 'measurement';
+                const entTypeVal = document.getElementById(`${formId}-enttype`)?.value || 'sensor';
+                const writeVal = document.getElementById(`${formId}-write`)?.checked ? 'checked' : '';
+                
+                html += `
+                    <div class="card" id="${formId}" style="margin-bottom: 1rem; background: rgba(255,255,255,0.01); border-color: rgba(255,255,255,0.04); padding: 1.25rem;">
+                        <div style="font-weight: 700; font-size: 1rem; margin-bottom: 0.75rem; color: var(--primary);">
+                            🛠️ Register ${addr} (${regType})
+                        </div>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem;">
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Naam</label>
+                                <input type="text" id="${formId}-name" value="${nameVal}" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Unique ID</label>
+                                <input type="text" id="${formId}-uid" value="${uidVal}" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Data Type</label>
+                                <select id="${formId}-datatype" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                                    <option value="int16" ${dataTypeVal === 'int16' ? 'selected' : ''}>int16 (Signed)</option>
+                                    <option value="uint16" ${dataTypeVal === 'uint16' ? 'selected' : ''}>uint16 (Unsigned)</option>
+                                    ${item.val_int32 !== undefined ? `
+                                    <option value="int32" ${dataTypeVal === 'int32' ? 'selected' : ''}>int32 (Signed 32-bit)</option>
+                                    <option value="uint32" ${dataTypeVal === 'uint32' ? 'selected' : ''}>uint32 (Unsigned 32-bit)</option>
+                                    ` : ''}
+                                </select>
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Scale / Factor</label>
+                                <input type="number" id="${formId}-scale" step="any" value="${scaleVal}" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Precisie (Decimalen)</label>
+                                <input type="number" id="${formId}-prec" min="0" max="10" value="${precVal}" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Eenheid (Unit)</label>
+                                <input type="text" id="${formId}-unit" value="${unitVal}" placeholder="bijv. °C, W, V" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Device Class</label>
+                                <select id="${formId}-devclass" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                                    <option value="" ${devClassVal === '' ? 'selected' : ''}>geen</option>
+                                    <option value="temperature" ${devClassVal === 'temperature' ? 'selected' : ''}>temperature (°C)</option>
+                                    <option value="power" ${devClassVal === 'power' ? 'selected' : ''}>power (W)</option>
+                                    <option value="energy" ${devClassVal === 'energy' ? 'selected' : ''}>energy (kWh)</option>
+                                    <option value="voltage" ${devClassVal === 'voltage' ? 'selected' : ''}>voltage (V)</option>
+                                    <option value="current" ${devClassVal === 'current' ? 'selected' : ''}>current (A)</option>
+                                    <option value="frequency" ${devClassVal === 'frequency' ? 'selected' : ''}>frequency (Hz)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">State Class</label>
+                                <select id="${formId}-stateclass" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                                    <option value="" ${stateClassVal === '' ? 'selected' : ''}>geen</option>
+                                    <option value="measurement" ${stateClassVal === 'measurement' ? 'selected' : ''}>measurement</option>
+                                    <option value="total_increasing" ${stateClassVal === 'total_increasing' ? 'selected' : ''}>total_increasing</option>
+                                    <option value="total" ${stateClassVal === 'total' ? 'selected' : ''}>total</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label style="display: block; font-size: 0.8rem; font-weight: 600; margin-bottom: 0.25rem; color: var(--text-muted);">Entity Type</label>
+                                <select id="${formId}-enttype" style="width: 100%; padding: 0.4rem; background: rgba(0,0,0,0.2); border: 1px solid var(--card-border); border-radius: 6px; color: #fff;">
+                                    <option value="sensor" ${entTypeVal === 'sensor' ? 'selected' : ''}>sensor</option>
+                                    <option value="switch" ${entTypeVal === 'switch' ? 'selected' : ''}>switch</option>
+                                    <option value="number" ${entTypeVal === 'number' ? 'selected' : ''}>number</option>
+                                </select>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 0.5rem; padding-top: 1.25rem;">
+                                <input type="checkbox" id="${formId}-write" ${writeVal} style="width: 18px; height: 18px;">
+                                <label for="${formId}-write" style="font-size: 0.85rem; font-weight: 600; cursor: pointer; color: var(--text-muted);">Schrijfbaar (Writeable)</label>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            });
+            
+            listContainer.innerHTML = html;
+        }
+
+        function saveScannedSensors() {
+            const checkedRows = Array.from(document.querySelectorAll('.scan-row-checkbox:checked'));
+            if (checkedRows.length === 0) {
+                alert("Selecteer ten minste één register om toe te voegen.");
+                return;
+            }
+            
+            const slaveId = parseInt(document.getElementById('scan-slave-id').value) || 1;
+            const sensorsToPost = [];
+            
+            for (const row of checkedRows) {
+                const addr = parseInt(row.getAttribute('data-addr'));
+                const regType = row.getAttribute('data-type');
+                const formId = `scan-form-${regType}-${addr}`;
+                
+                const name = document.getElementById(`${formId}-name`).value.trim();
+                const uid = document.getElementById(`${formId}-uid`).value.trim();
+                const dataType = document.getElementById(`${formId}-datatype`).value;
+                const scale = parseFloat(document.getElementById(`${formId}-scale`).value);
+                const precision = parseInt(document.getElementById(`${formId}-prec`).value);
+                const unit = document.getElementById(`${formId}-unit`).value.trim();
+                const devClass = document.getElementById(`${formId}-devclass`).value;
+                const stateClass = document.getElementById(`${formId}-stateclass`).value;
+                const entityType = document.getElementById(`${formId}-enttype`).value;
+                const writeable = document.getElementById(`${formId}-write`).checked;
+                
+                if (!name) {
+                    alert(`Vul a.u.b. een naam in voor register ${addr}.`);
+                    return;
+                }
+                if (!uid) {
+                    alert(`Vul a.u.b. een Unique ID in voor register ${addr}.`);
+                    return;
+                }
+                
+                sensorsToPost.push({
+                    name: name,
+                    unique_id: uid,
+                    slave: slaveId,
+                    register_type: regType,
+                    address: addr,
+                    data_type: dataType,
+                    scale: isNaN(scale) ? 1.0 : scale,
+                    precision: isNaN(precision) ? 0 : precision,
+                    unit_of_measurement: unit,
+                    device_class: devClass,
+                    state_class: stateClass,
+                    entity_type: entityType,
+                    writeable: writeable
+                });
+            }
+            
+            const btn = document.getElementById('btn-save-scanned');
+            btn.disabled = true;
+            btn.innerText = "⏳ Bezig met toevoegen...";
+            
+            const addURL = ingressPath + "/api/add-sensors";
+            fetch(addURL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ sensors: sensorsToPost })
+            })
+            .then(response => response.json().then(data => ({ status: response.status, data })))
+            .then(({ status, data }) => {
+                btn.disabled = false;
+                btn.innerText = "➕ Voeg geselecteerde sensoren toe aan configuratie";
+                
+                if (status === 200 && data.success) {
+                    alert(data.message);
+                    switchTab('dashboard');
+                    document.getElementById('scan-results-container').style.display = "none";
+                    document.getElementById('scan-progress-container').style.display = "none";
+                    document.querySelectorAll('.scan-row-checkbox').forEach(cb => cb.checked = false);
+                    handleScanRowSelect();
+                } else {
+                    alert("Fout bij opslaan: " + (data.error || 'Onbekende fout'));
+                }
+            })
+            .catch(err => {
+                btn.disabled = false;
+                btn.innerText = "➕ Voeg geselecteerde sensoren toe aan configuratie";
+                alert("Netwerkfout bij opslaan: " + err.message);
             });
         }
 
