@@ -123,55 +123,69 @@ class ModbusMqttBridge:
         """Laad het YAML configuratiebestand of de Home Assistant options.json in."""
         if os.path.exists("/data/options.json"):
             logger.info("Home Assistant Addon gedetecteerd. Opties inlezen uit /data/options.json...")
+            self.is_addon = True
+            
+            # Gebruik /data/config.yaml voor persistentie in addon-modus
+            addon_config_path = "/data/config.yaml"
+            if not os.path.exists(addon_config_path):
+                logger.info(f"Geen persistente config.yaml gevonden op {addon_config_path}. Initialiseren met standaard config...")
+                try:
+                    import shutil
+                    if os.path.exists(self.config_path):
+                        shutil.copy(self.config_path, addon_config_path)
+                    elif os.path.exists("config.yaml"):
+                        shutil.copy("config.yaml", addon_config_path)
+                except Exception as e:
+                    logger.error(f"Fout bij kopiëren van standaard config.yaml naar /data: {e}")
+            
+            self.config_path = addon_config_path
+            
             try:
                 with open("/data/options.json", 'r', encoding='utf-8') as f:
                     ha_options = json.load(f)
                 
-                # Transformeer de platte HA-addon opties naar de interne geneste structuur
+                # Probeer de persistente config.yaml te laden
+                local_cfg = {}
+                if os.path.exists(self.config_path):
+                    try:
+                        with open(self.config_path, 'r', encoding='utf-8') as cf:
+                            local_cfg = yaml.safe_load(cf) or {}
+                        logger.info(f"Persistente config.yaml succesvol geladen van {self.config_path}")
+                    except Exception as e:
+                        logger.error(f"Fout bij laden van {self.config_path}: {e}")
+
+                # Combineer HA-addon opties met de persistente config.yaml (prioriteit voor config.yaml)
+                local_mqtt = local_cfg.get("mqtt", {})
+                local_modbus = local_cfg.get("modbus", {})
+                
                 self.config = {
                     "mqtt": {
-                        "broker": ha_options.get("mqtt_broker", "localhost"),
-                        "port": ha_options.get("mqtt_port", 1883),
-                        "username": ha_options.get("mqtt_username"),
-                        "password": ha_options.get("mqtt_password"),
-                        "topic_prefix": ha_options.get("mqtt_topic_prefix", "usr_n580_bridge"),
-                        "discovery_prefix": ha_options.get("mqtt_discovery_prefix", "homeassistant"),
-                        "client_id": "modbus_mqtt_bridge",
-                        "keepalive": 60
+                        "broker": local_mqtt.get("broker") or ha_options.get("mqtt_broker", "localhost"),
+                        "port": local_mqtt.get("port") or ha_options.get("mqtt_port", 1883),
+                        "username": local_mqtt.get("username") or ha_options.get("mqtt_username"),
+                        "password": local_mqtt.get("password") or ha_options.get("mqtt_password"),
+                        "topic_prefix": local_mqtt.get("topic_prefix") or ha_options.get("mqtt_topic_prefix", "usr_n580_bridge"),
+                        "discovery_prefix": local_mqtt.get("discovery_prefix") or ha_options.get("mqtt_discovery_prefix", "homeassistant"),
+                        "client_id": local_mqtt.get("client_id", "modbus_mqtt_bridge"),
+                        "keepalive": local_mqtt.get("keepalive", 60)
                     },
                     "modbus": {
-                        "host": ha_options.get("modbus_host", "192.168.50.96"),
-                        "port": ha_options.get("modbus_port", 41),
-                        "timeout": 3,
-                        "poll_interval": ha_options.get("poll_interval", 15),
-                        "retries": ha_options.get("retries", 3),
-                        "delay_between_requests": ha_options.get("delay_between_requests", 0.1),
-                        "max_gap": ha_options.get("max_gap", 10),
-                        "slave_retries": ha_options.get("slave_retries", {})
+                        "host": local_modbus.get("host") or ha_options.get("modbus_host", "192.168.50.96"),
+                        "port": local_modbus.get("port") or ha_options.get("modbus_port", 41),
+                        "timeout": local_modbus.get("timeout", 3),
+                        "poll_interval": local_modbus.get("poll_interval") or ha_options.get("poll_interval", 15),
+                        "retries": local_modbus.get("retries") or ha_options.get("retries", 3),
+                        "delay_between_requests": local_modbus.get("delay_between_requests") or ha_options.get("delay_between_requests", 0.1),
+                        "max_gap": local_modbus.get("max_gap") or ha_options.get("max_gap", 10),
+                        "slave_retries": local_modbus.get("slave_retries") or ha_options.get("slave_retries", {})
                     },
-                    "log_level": ha_options.get("log_level", "info"),
-                    "sensors": []
+                    "log_level": local_cfg.get("log_level") or ha_options.get("log_level", "info"),
+                    "sensors": local_cfg.get("sensors") or ha_options.get("sensors", [])
                 }
                 
-                # Probeer sensors uit de lokale config.yaml te laden indien aanwezig, anders uit ha_options
-                if os.path.exists("config.yaml"):
-                    logger.info("Lokale config.yaml gevonden. Laden van sensors uit config.yaml...")
-                    try:
-                        with open("config.yaml", 'r', encoding='utf-8') as cf:
-                            local_cfg = yaml.safe_load(cf)
-                            self.config["sensors"] = local_cfg.get("sensors", [])
-                        logger.info(f"Sensoren succesvol geladen uit config.yaml (Totaal: {len(self.config['sensors'])} sensoren).")
-                    except Exception as e:
-                        logger.error(f"Fout bij laden van sensors uit config.yaml: {e}. Terugvallen op addon opties...")
-                        self.config["sensors"] = ha_options.get("sensors", [])
-                else:
-                    logger.warning("Geen lokale config.yaml gevonden. Laden van sensors uit addon opties...")
-                    self.config["sensors"] = ha_options.get("sensors", [])
-
-                self.is_addon = True
-                logger.info("Addon opties succesvol ingeladen en getransformeerd!")
+                logger.info("Addon opties succesvol ingeladen en getransformeerd met persistentie!")
             except Exception as e:
-                logger.error(f"Fout bij inlezen Home Assistant opties: {e}")
+                logger.error(f"Fout bij verwerken van Home Assistant opties: {e}")
                 sys.exit(1)
         else:
             logger.info(f"Configuratie inlezen van: {self.config_path}")

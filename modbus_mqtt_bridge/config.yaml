@@ -1,5 +1,5 @@
 name: "Modbus to MQTT Bridge"
-version: "1.0.16"
+version: "1.0.17"
 slug: "modbus_mqtt_bridge"
 description: "Bridge Modbus RTU-over-TCP devices to Home Assistant via MQTT"
 arch:
@@ -40,5 +40,4 @@ schema:
   retries: int?
   delay_between_requests: float?
   max_gap: int?
-  slave_retries: map(int)?
 
