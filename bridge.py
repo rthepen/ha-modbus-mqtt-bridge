@@ -78,6 +78,7 @@ class ModbusMqttBridge:
         self.mqtt_connected = False
         self.slave_states = {}  # Track connectivity status per slave
         self.last_published_values = {}  # Track last published values per sensor
+        self.last_full_republish_time = time.time()
         self.is_addon = False
         
         # Statistieken & status tracking voor dashboard
@@ -302,6 +303,12 @@ class ModbusMqttBridge:
             if subscribed_count > 0:
                 mqtt_logger.info(f"Geabonneerd op {subscribed_count} command topics.")
                     
+            # Abonneer op Home Assistant status topic om herstarts te detecteren
+            disc_prefix = self.config.get("mqtt", {}).get("discovery_prefix", "homeassistant")
+            status_topic = f"{disc_prefix}/status"
+            mqtt_logger.info(f"Abonneren op Home Assistant status topic: {status_topic}")
+            self.mqtt_client.subscribe(status_topic)
+
             # Direct HA Discovery uitvoeren om entiteiten aan te maken/vernieuwen
             self.publish_ha_discovery()
             
@@ -316,12 +323,24 @@ class ModbusMqttBridge:
         self.mqtt_connected = False
 
     def on_mqtt_message(self, client, userdata, msg):
-        """Callback bij ontvangen MQTT bericht (commando)."""
+        """Callback bij ontvangen MQTT bericht (commando of status)."""
         try:
             topic = msg.topic
             payload = msg.payload.decode('utf-8')
             mqtt_logger.info(f"MQTT bericht ontvangen op {topic}: {payload}")
             
+            # Controleer of dit de Home Assistant status is
+            disc_prefix = self.config.get("mqtt", {}).get("discovery_prefix", "homeassistant")
+            if topic == f"{disc_prefix}/status":
+                if payload.lower() == "online":
+                    mqtt_logger.info("Home Assistant is ONLINE gedetecteerd! Herpubliceren van discovery en actuele sensorwaarden...")
+                    self.publish_ha_discovery()
+                    # Wis de cache zodat alle actuele waarden direct geforceerd gepubliceerd worden
+                    self.last_published_values.clear()
+                    for uid, val_data in list(self.sensor_values.items()):
+                        self.publish_sensor_value(uid, val_data["value"])
+                return
+
             # Ontleed het topic: [topic_prefix]/[entity_type]/[unique_id]/set
             parts = topic.split('/')
             if len(parts) < 4 or parts[-1] != "set":
@@ -906,6 +925,14 @@ class ModbusMqttBridge:
     # --------------------------------------------------------------------------
     def poll_all_sensors(self):
         """Lees alle sensoren uit via geoptimaliseerde blokken met fallback."""
+        # Periodieke force-republish na 30 minuten (1800 seconden)
+        if not hasattr(self, "last_full_republish_time"):
+            self.last_full_republish_time = time.time()
+        elif time.time() - self.last_full_republish_time > 1800:
+            logger.info("Periodieke force-republish: MQTT publicatie-cache leegmaken...")
+            self.last_published_values.clear()
+            self.last_full_republish_time = time.time()
+
         if True:
             if not hasattr(self, "sensor_blocks") or not self.sensor_blocks:
                 self.group_sensors()
