@@ -69,7 +69,7 @@ sensors:
     state_class: "measurement"
     writeable: true
     entity_type: "number"
-    min: 15
+    min: 5
     max: 45
     step: 1
 
